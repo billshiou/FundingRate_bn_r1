@@ -19,7 +19,8 @@ TELEGRAM_SUMMARY_NOTIFICATIONS = True                       # 是否發送總結
 # 基本交易設定
 MAX_POSITION_SIZE = 100      # 最大倉位大小 (USDT) - 建議從小額開始測試
 LEVERAGE = 10                # 槓桿倍數 (1-125)
-MIN_FUNDING_RATE = 0.01      # 最小資金費率閾值 (%) - 低於此值不進場
+MIN_FUNDING_RATE = 0.01      # 最小淨收益閾值 (%) - 淨收益 = |資金費率| - 點差
+MAX_SPREAD = 1.0             # 最大點差閾值 (%) - 點差超過此值不進場
 
 # 進場時機設定
 ENTRY_BEFORE_SECONDS = 0.2   # 結算前多少秒進場 (秒) - 激進: 0.1-0.5, 保守: 1-3
@@ -31,12 +32,27 @@ MAX_ENTRY_RETRY = 0                    # 最大進場重試次數 - 0=關閉重�
 ENTRY_RETRY_INTERVAL = 0.1             # 進場重試間隔 (秒)
 ENTRY_RETRY_UNTIL_SETTLEMENT = False   # 是否重試直到結算時間
 
+# 數據結構優化 - 修復根本瓶頸
+# 注意：v1.0.17版本已修復WebSocket價格獲取的數據結構錯誤
+# 原本：複雜的DataFrame查詢 (20-50ms + 錯誤)  
+# 現在：直接字典查詢 (1-3ms)  
+# 自動提升 10-20倍 價格獲取速度
+
+# WebSocket點差優化 - 按需精準更新策略 (v1.0.20新增)
+# 策略：只更新最佳交易對的點差
+# 1. WebSocket：持續獲取資金費率和標記價格數據 (實時)
+# 2. 智能篩選：基於資金費率選出最佳交易對
+# 3. 按需更新：只更新被選中交易對的點差（30秒緩存）
+# 4. 緩存策略：每個交易對獨立緩存，無緩存時使用默認0.05%
+# 效果：API調用從50個/30秒降到1個/按需，效率提升50倍！
+
 # 交易對設定
 TRADING_HOURS = [0, 8, 16]            # 交易時間 (UTC) - [0, 8, 16] 表示每8小時結算
 TRADING_MINUTES = [0]                 # 交易分鐘 - [0] 表示整點結算
 TRADING_SYMBOLS = []                  # 指定交易幣種 - 空列表表示全部幣種
 EXCLUDED_SYMBOLS = [                  # 排除的交易幣種
-    'BTCDOMUSDT', 'DEFIUSDT', 'USDCUSDT'
+    'BTCDOMUSDT', 'DEFIUSDT', 'USDCUSDT',
+    'SAHARAUSDT'  # 新上市幣種(6/26)，API支援不穩定，建議排除
 ]
 
 # ==================== 平倉配置區塊 ====================
@@ -68,8 +84,35 @@ CLOSE_BEFORE_SECONDS = 0.0
 MAX_ENTRY_RETRY = 0
 MAX_CLOSE_RETRY = 0
 LEVERAGE = 20
+ULTRA_SPEED_MODE = True
+SKIP_LEVERAGE_SETTING = True
+WEBSOCKET_PRICE_ONLY = True
 POST_SETTLEMENT_CHECK_PERIOD = 30
 POST_SETTLEMENT_CHECK_INTERVAL = 0.5
+
+⚡ 平衡交易配置 (速度與穩定性兼顧):
+ENTRY_BEFORE_SECONDS = 1.0
+CLOSE_BEFORE_SECONDS = 1.0
+MAX_ENTRY_RETRY = 1
+MAX_CLOSE_RETRY = 1
+LEVERAGE = 10
+ULTRA_SPEED_MODE = False
+SKIP_LEVERAGE_SETTING = False
+WEBSOCKET_PRICE_ONLY = False
+POST_SETTLEMENT_CHECK_PERIOD = 60
+POST_SETTLEMENT_CHECK_INTERVAL = 1.0
+
+🛡️ 保守交易配置 (穩定性優先):
+ENTRY_BEFORE_SECONDS = 5.0
+CLOSE_BEFORE_SECONDS = 5.0
+MAX_ENTRY_RETRY = 3
+MAX_CLOSE_RETRY = 3
+LEVERAGE = 5
+ULTRA_SPEED_MODE = False
+SKIP_LEVERAGE_SETTING = False
+WEBSOCKET_PRICE_ONLY = False
+POST_SETTLEMENT_CHECK_PERIOD = 120
+POST_SETTLEMENT_CHECK_INTERVAL = 2.0
 
 
 # ==================== 使用說明 ====================

@@ -66,8 +66,9 @@ API_SECRET = "your_api_secret_here"
 - `MAX_POSITION_SIZE`: 最大倉位大小 (USDT)
 - `LEVERAGE`: 槓桿倍數
 - `MIN_FUNDING_RATE`: 最小資金費率閾值
-- `ENTRY_BEFORE_SECONDS`: 進場提前時間
-- `CLOSE_BEFORE_SECONDS`: 平倉提前時間
+- `MAX_SPREAD`: 最大點差閾值 (超過此值不進場)
+- `ENTRY_BEFORE_SECONDS`: 進場提前時間 (使用校正時間)
+- `CLOSE_BEFORE_SECONDS`: 平倉提前時間 (使用校正時間)
 
 ## 🚀 使用方法
 
@@ -138,6 +139,7 @@ POST_SETTLEMENT_CHECK_INTERVAL = 2
 MAX_POSITION_SIZE = 50      # 單次最大保證金 (USDT)
 LEVERAGE = 4                # 槓桿倍數
 MIN_FUNDING_RATE = 0.2      # 最小資金費率 (%)
+MAX_SPREAD = 1.0            # 最大點差閾值 (%)
 
 # 時間配置
 ENTRY_BEFORE_SECONDS = 0.2  # 進場提前時間 (秒)

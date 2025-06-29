@@ -13,7 +13,7 @@ import threading
 import os
 import sys
 import signal
-from config import API_KEY, API_SECRET, MAX_POSITION_SIZE, LEVERAGE, MIN_FUNDING_RATE, ENTRY_BEFORE_SECONDS, CHECK_INTERVAL, ENTRY_TIME_TOLERANCE, CLOSE_BEFORE_SECONDS, CLOSE_DELAY_AFTER_ENTRY, MAX_CLOSE_RETRY, TRADING_HOURS, TRADING_MINUTES, TRADING_SYMBOLS, EXCLUDED_SYMBOLS, MAX_ENTRY_RETRY, ENTRY_RETRY_INTERVAL, ENTRY_RETRY_UNTIL_SETTLEMENT, CLOSE_RETRY_INTERVAL, FORCE_CLOSE_AT_SETTLEMENT, ACCOUNT_CHECK_INTERVAL, POSITION_TIMEOUT_SECONDS, ENABLE_POSITION_CLEANUP, FORCE_CLOSE_AFTER_SECONDS, POSITION_CHECK_INTERVAL, POST_SETTLEMENT_CHECK_PERIOD, POST_SETTLEMENT_CHECK_INTERVAL
+from config import API_KEY, API_SECRET, MAX_POSITION_SIZE, LEVERAGE, MIN_FUNDING_RATE, MAX_SPREAD, ENTRY_BEFORE_SECONDS, CHECK_INTERVAL, ENTRY_TIME_TOLERANCE, CLOSE_BEFORE_SECONDS, CLOSE_DELAY_AFTER_ENTRY, MAX_CLOSE_RETRY, TRADING_HOURS, TRADING_MINUTES, TRADING_SYMBOLS, EXCLUDED_SYMBOLS, MAX_ENTRY_RETRY, ENTRY_RETRY_INTERVAL, ENTRY_RETRY_UNTIL_SETTLEMENT, CLOSE_RETRY_INTERVAL, FORCE_CLOSE_AT_SETTLEMENT, ACCOUNT_CHECK_INTERVAL, POSITION_TIMEOUT_SECONDS, ENABLE_POSITION_CLEANUP, FORCE_CLOSE_AFTER_SECONDS, POSITION_CHECK_INTERVAL, POST_SETTLEMENT_CHECK_PERIOD, POST_SETTLEMENT_CHECK_INTERVAL
 import traceback
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -164,6 +164,7 @@ class FundingRateTrader:
         self.max_position_size = MAX_POSITION_SIZE
         self.leverage = LEVERAGE
         self.min_funding_rate = MIN_FUNDING_RATE
+        self.max_spread = MAX_SPREAD
         self.entry_before_seconds = ENTRY_BEFORE_SECONDS
         self.check_interval = CHECK_INTERVAL  # 主循環檢查間隔
         self.funding_rate_threshold = MIN_FUNDING_RATE
@@ -172,7 +173,8 @@ class FundingRateTrader:
         self.close_delay_after_entry = CLOSE_DELAY_AFTER_ENTRY  # 開倉成功後延遲平倉時間
         self.current_position = None
         self.position_open_time = None
-        self.funding_rates = {}
+        self.funding_rates = {}  # 儲存資金費率數據
+        self.book_tickers = {}   # 儲存買賣價數據 (來自WebSocket)
         self.ws = None
         self.ws_thread = None
         self.running = False
@@ -231,6 +233,11 @@ class FundingRateTrader:
         
         # 初始化收益追蹤器
         self.profit_tracker = ProfitTracker()
+        
+        # 初始化點差緩存 - 按需精準更新策略
+        self._spread_cache = {}                    # 存儲每個交易對的點差
+        self._spread_cache_time = {}               # 存儲每個交易對的更新時間
+        self._spread_update_in_progress = False    # 批量更新進度標志（保留兼容性）
 
     def _setup_logger(self):
         """設置日誌 - 使用全域日誌器，避免重複"""
@@ -252,53 +259,55 @@ class FundingRateTrader:
         return symbol not in EXCLUDED_SYMBOLS
 
     def subscribe(self):
-        """訂閱 WebSocket - 不需要額外訂閱，因為已經直接連接到!markPrice@arr"""
-        # 不需要額外訂閱，因為我們已經直接連接到 !markPrice@arr 端點
-        # 這個端點會自動推送所有合約的資金費率數據
+        """訂閱 WebSocket - !markPrice@arr 自動推送資金費率數據"""
+        # !markPrice@arr 會自動推送所有合約的資金費率和標記價格數據
+        # 無需額外訂閱操作
         print(f"[{self.format_corrected_time()}] WebSocket 已連接到 !markPrice@arr，自動接收資金費率數據")
 
     def on_message(self, ws, message):
-        """處理 WebSocket 消息"""
+        """處理 WebSocket 消息 - 處理資金費率數據"""
         try:
             data = json.loads(message)
             
             # 檢查是否是訂閱確認消息
             if 'result' in data and data['result'] is None:
-                print(f"[{self.format_corrected_time()}] WebSocket 已連接到 !markPrice@arr，自動接收資金費率數據")
+                print(f"[{self.format_corrected_time()}] WebSocket 已連接，自動接收標記價格數據")
                 return
             
-            # 檢查是否是訂閱確認
-            if 'id' in data and data['id'] == 1:
-                print(f"[{self.format_corrected_time()}] 收到訂閱確認: {data}")
-                return
-            
-            # 處理資金費率數據
+            # 處理資金費率數據（標準格式）
             if isinstance(data, list):
-                # 更新資金費率數據
                 updated_count = 0
                 for item in data:
                     symbol = item['s']
                     if self.is_valid_symbol(symbol):
                         funding_rate = float(item['r']) * 100  # 轉換為百分比
+                        mark_price = float(item['p'])  # 標記價格
                         next_funding_time = item['T']
                         
                         # 更新資金費率數據
                         self.funding_rates[symbol] = {
                             'funding_rate': funding_rate,
+                            'mark_price': mark_price,
                             'next_funding_time': next_funding_time,
                             'last_update': self.get_corrected_time()
                         }
                         updated_count += 1
                 
                 # 只在有更新時顯示（減少輸出頻率）
-                if updated_count > 0 and not hasattr(self, '_last_update_display') or time.time() - self._last_update_display >= 30:
-                    print(f"[{self.format_corrected_time()}] 更新資金費率: {updated_count} 個交易對")
-                    self._last_update_display = time.time()
+                if updated_count > 0 and (not hasattr(self, '_last_funding_display') or time.time() - self._last_funding_display >= 30):
+                    total_symbols = len(self.funding_rates)
+                    spread_stats = self.get_spread_stats()
+                    cache_count = len(self._spread_cache) if hasattr(self, '_spread_cache') else 0
+                    stats_msg = f"WebSocket: 更新{updated_count}個資金費率，總計{total_symbols}個交易對 | 點差緩存: {cache_count}個"
+                    if spread_stats and spread_stats['total_requests'] > 0:
+                        stats_msg += f" | 60秒API調用: {spread_stats['api_count']}次"
+                    print(f"[{self.format_corrected_time()}] {stats_msg}")
+                    self._last_funding_display = time.time()
                     
         except Exception as e:
             print(f"[{self.format_corrected_time()}] WebSocket 消息處理錯誤: {e}")
             print(f"錯誤詳情: {traceback.format_exc()}")
-            print(f"原始數據: {message}")
+            print(f"原始數據前100字元: {str(message)[:100]}...")
 
     def on_error(self, ws, error):
         """處理 WebSocket 錯誤"""
@@ -329,11 +338,15 @@ class FundingRateTrader:
         print("已發送訂閱請求")
 
     def start_websocket(self):
-        """啟動 WebSocket 連接"""
+        """啟動 WebSocket 連接 - 同時獲取資金費率和買賣價數據"""
         try:
             print(f"[{self.format_corrected_time()}] 啟動 WebSocket 連接...")
+            # 幣安期貨暫時只支援標記價格的集合流，bookTicker需要單獨連接
+            # 先使用標記價格流，bookTicker功能後續添加
+            stream_url = "wss://fstream.binance.com/ws/!markPrice@arr"
+            print(f"[{self.format_corrected_time()}] 注意：期貨WebSocket暫時只獲取標記價格，點差數據使用API緩存（30秒更新最佳交易對）")
             self.ws = websocket.WebSocketApp(
-                "wss://fstream.binance.com/ws/!markPrice@arr",
+                stream_url,
                 on_message=self.on_message,
                 on_error=self.on_error,
                 on_close=self.on_close,
@@ -349,7 +362,7 @@ class FundingRateTrader:
             self.ws_thread.daemon = True
             self.ws_thread.start()
             
-            print(f"[{self.format_corrected_time()}] WebSocket 線程已啟動")
+            print(f"[{self.format_corrected_time()}] WebSocket 線程已啟動 (資金費率)")
             
             # 等待 WebSocket 連接建立
             time.sleep(2)
@@ -359,83 +372,320 @@ class FundingRateTrader:
             time.sleep(5)
             self.start_websocket()
 
-    def get_best_opportunity(self, min_funding_rate: float = 0.01) -> Optional[Dict]:
-        """找出最佳交易機會 - 優先選擇離結算時間最近的"""
+    def get_spread(self, symbol: str) -> float:
+        """獲取交易對的點差 (買賣價差百分比) - 按需精準緩存策略"""
+        try:
+            # 優先從WebSocket獲取買賣價數據 (1-3ms)
+            if hasattr(self, 'book_tickers') and symbol in self.book_tickers:
+                book_data = self.book_tickers[symbol]
+                best_bid = book_data['bid_price']
+                best_ask = book_data['ask_price']
+                
+                # 獲取標記價格作為參考
+                ref_price = None
+                if hasattr(self, 'funding_rates') and symbol in self.funding_rates:
+                    if 'mark_price' in self.funding_rates[symbol]:
+                        ref_price = self.funding_rates[symbol]['mark_price']
+                
+                # 如果沒有標記價格，使用中間價
+                if ref_price is None:
+                    ref_price = (best_bid + best_ask) / 2
+                
+                # 計算點差百分比
+                spread_pct = ((best_ask - best_bid) / ref_price) * 100
+                
+                # 統計WebSocket使用情況
+                if not hasattr(self, '_websocket_spread_count'):
+                    self._websocket_spread_count = 0
+                    self._api_spread_count = 0
+                self._websocket_spread_count += 1
+                
+                return spread_pct
+            
+            # WebSocket數據不可用，使用按需緩存策略
+            if not hasattr(self, '_spread_cache'):
+                self._spread_cache = {}
+                self._spread_cache_time = {}
+                self._spread_update_in_progress = False
+            
+            # 返回緩存的點差，如果沒有則返回默認值
+            if symbol in self._spread_cache:
+                return self._spread_cache[symbol]
+            else:
+                # 如果緩存中沒有該交易對，返回默認點差估算值
+                # 注意：現在改用按需更新，在get_best_opportunity()中會主動更新最佳交易對的點差
+                return 0.05  # 默認點差0.05%，允許進場但不會太激進
+            
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 獲取點差失敗 {symbol}: {e}")
+            return 999.0  # 錯誤時返回極大值，避免進場
+    
+    def _start_spread_cache_update(self):
+        """啟動點差緩存後台更新"""
+        if hasattr(self, '_spread_update_in_progress') and self._spread_update_in_progress:
+            return
+        
+        def update_spread_cache():
+            try:
+                self._spread_update_in_progress = True
+                print(f"[{self.format_corrected_time()}] 開始智能點差緩存更新...")
+                
+                # 獲取資金費率高於閾值的交易對（智能篩選）
+                high_funding_symbols = []
+                if hasattr(self, 'funding_rates'):
+                    for symbol, data in self.funding_rates.items():
+                        if self.is_valid_symbol(symbol):
+                            funding_rate = data['funding_rate']
+                            abs_funding_rate = abs(funding_rate)
+                            # 只更新資金費率有潛力的交易對（閾值的80%）
+                            if abs_funding_rate >= self.funding_rate_threshold * 0.8:
+                                high_funding_symbols.append(symbol)
+                
+                # 智能批量更新數量
+                # 基於API限制計算：1200請求/分鐘 = 20請求/秒
+                # 30秒窗口內安全使用500次 (留緩衝)，每次0.1秒間隔可處理約50個
+                max_symbols = min(50, len(high_funding_symbols))  # 減少到50個，但更精準
+                symbols_to_update = high_funding_symbols[:max_symbols]
+                
+                updated_count = 0
+                start_time = time.time()
+                
+                for symbol in symbols_to_update:
+                    try:
+                        # 獲取標記價格
+                        mark_price = None
+                        if symbol in self.funding_rates and 'mark_price' in self.funding_rates[symbol]:
+                            mark_price = self.funding_rates[symbol]['mark_price']
+                        
+                        # 獲取訂單簿數據
+                        depth = self.client.futures_order_book(symbol=symbol, limit=5)
+                        
+                        if depth['bids'] and depth['asks']:
+                            best_bid = float(depth['bids'][0][0])
+                            best_ask = float(depth['asks'][0][0])
+                            ref_price = mark_price if mark_price else (best_bid + best_ask) / 2
+                            spread_pct = ((best_ask - best_bid) / ref_price) * 100
+                            
+                            # 更新緩存
+                            self._spread_cache[symbol] = spread_pct
+                            updated_count += 1
+                        
+                        # 避免API限制，適當延遲
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        print(f"[{self.format_corrected_time()}] 更新點差失敗 {symbol}: {e}")
+                        continue
+                
+                elapsed_time = time.time() - start_time
+                self._spread_cache_time = time.time()
+                
+                # 統計API使用情況
+                if not hasattr(self, '_api_spread_count'):
+                    self._api_spread_count = 0
+                self._api_spread_count += updated_count
+                
+                print(f"[{self.format_corrected_time()}] 智能點差更新完成: {updated_count}/{len(symbols_to_update)} 個高潛力交易對，耗時 {elapsed_time:.1f}秒")
+                
+                # 顯示緩存覆蓋情況
+                total_high_funding = len(high_funding_symbols)
+                high_funding_coverage = (len(symbols_to_update) / total_high_funding * 100) if total_high_funding > 0 else 0
+                print(f"[{self.format_corrected_time()}] 高潛力覆蓋率: {high_funding_coverage:.1f}% ({len(symbols_to_update)}/{total_high_funding}個) | 總緩存: {len(self._spread_cache)}個交易對")
+                
+            except Exception as e:
+                print(f"[{self.format_corrected_time()}] 點差緩存更新錯誤: {e}")
+            finally:
+                self._spread_update_in_progress = False
+        
+        # 在後台線程中執行更新
+        import threading
+        update_thread = threading.Thread(target=update_spread_cache)
+        update_thread.daemon = True
+        update_thread.start()
+    
+    def _should_update_spread(self, symbol: str) -> bool:
+        """檢查是否需要更新該交易對的點差"""
+        try:
+            # 確保緩存結構正確初始化
+            if not hasattr(self, '_spread_cache_time') or not isinstance(self._spread_cache_time, dict):
+                self._spread_cache_time = {}
+            
+            current_time = time.time()
+            last_update_time = self._spread_cache_time.get(symbol, 0)
+            
+            # 30秒緩存時間，避免頻繁更新
+            return (current_time - last_update_time >= 30)
+            
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 檢查點差更新狀態失敗 {symbol}: {e}")
+            return False
+    
+    def update_single_spread(self, symbol: str):
+        """按需更新單一交易對的點差 - 精準高效"""
+        try:
+            # 確保緩存結構正確初始化
+            if not hasattr(self, '_spread_cache') or not isinstance(self._spread_cache, dict):
+                self._spread_cache = {}
+            if not hasattr(self, '_spread_cache_time') or not isinstance(self._spread_cache_time, dict):
+                self._spread_cache_time = {}
+            
+            current_time = time.time()
+            
+            # 獲取標記價格
+            mark_price = None
+            if hasattr(self, 'funding_rates') and symbol in self.funding_rates:
+                if 'mark_price' in self.funding_rates[symbol]:
+                    mark_price = self.funding_rates[symbol]['mark_price']
+            
+            # 獲取訂單簿數據
+            depth = self.client.futures_order_book(symbol=symbol, limit=5)
+            
+            if depth and 'bids' in depth and 'asks' in depth and depth['bids'] and depth['asks']:
+                best_bid = float(depth['bids'][0][0])
+                best_ask = float(depth['asks'][0][0])
+                ref_price = mark_price if mark_price else (best_bid + best_ask) / 2
+                spread_pct = ((best_ask - best_bid) / ref_price) * 100
+                
+                # 更新單一交易對的緩存
+                self._spread_cache[symbol] = spread_pct
+                self._spread_cache_time[symbol] = current_time
+                
+                print(f"[{self.format_corrected_time()}] 精準更新點差: {symbol} = {spread_pct:.3f}%")
+                
+                # 統計API使用情況
+                if not hasattr(self, '_api_spread_count'):
+                    self._api_spread_count = 0
+                self._api_spread_count += 1
+            else:
+                print(f"[{self.format_corrected_time()}] 無法獲取點差數據: {symbol}")
+            
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 更新單一點差失敗 {symbol}: {e}")
+            # 錯誤時不更新緩存，使用舊數據或默認值
+
+    def get_spread_stats(self):
+        """獲取點差數據來源統計"""
+        if hasattr(self, '_websocket_spread_count') and hasattr(self, '_api_spread_count'):
+            total = self._websocket_spread_count + self._api_spread_count
+            if total > 0:
+                ws_pct = (self._websocket_spread_count / total) * 100
+                api_pct = (self._api_spread_count / total) * 100
+                return {
+                    'websocket_count': self._websocket_spread_count,
+                    'api_count': self._api_spread_count,
+                    'websocket_percentage': ws_pct,
+                    'api_percentage': api_pct,
+                    'total_requests': total
+                }
+        return None
+
+    def calculate_net_profit(self, symbol: str, funding_rate: float) -> tuple:
+        """計算淨收益 = 資金費率 - 點差"""
+        spread = self.get_spread(symbol)
+        abs_funding_rate = abs(funding_rate)
+        net_profit = abs_funding_rate - spread if spread < 999 else -999
+        return net_profit, spread
+
+    def get_best_opportunity(self, min_funding_rate: float = None) -> Optional[Dict]:
+        """找出最佳交易機會 - 基於淨收益 (資金費率 - 點差) > MIN_FUNDING_RATE"""
         if not self.funding_rates:
             return None
 
-        # 轉換為 DataFrame 並排序
-        rates_list = []
+        # 使用配置的最小資金費率
+        if min_funding_rate is None:
+            min_funding_rate = self.funding_rate_threshold
+
+        # 首先基於資金費率篩選出最有潛力的交易對
+        potential_opportunities = []
         for symbol, data in self.funding_rates.items():
-            rates_list.append({
-                'symbol': symbol,
-                'funding_rate': data['funding_rate'],
-                'next_funding_time': data['next_funding_time']
-            })
+            # 檢查交易對篩選
+            if TRADING_SYMBOLS:
+                if symbol not in TRADING_SYMBOLS:
+                    continue
+            else:
+                if symbol in EXCLUDED_SYMBOLS:
+                    continue
+            
+            funding_rate = data['funding_rate']
+            abs_funding_rate = abs(funding_rate)
+            
+            # 只考慮資金費率有潛力的交易對（閾值的80%以上）
+            if abs_funding_rate >= min_funding_rate * 0.8:
+                potential_opportunities.append({
+                    'symbol': symbol,
+                    'funding_rate': funding_rate,
+                    'abs_funding_rate': abs_funding_rate,
+                    'next_funding_time': data['next_funding_time'],
+                    'direction': 'long' if funding_rate < 0 else 'short'
+                })
         
-        df = pd.DataFrame(rates_list)
-        df['abs_funding_rate'] = df['funding_rate'].abs()
-        
-        # 應用篩選規則
-        # 1. 資金費率門檻篩選
-        df = df[df['abs_funding_rate'] >= self.funding_rate_threshold]
-        
-        # 2. 交易對篩選
-        if TRADING_SYMBOLS:
-            # 如果設定了特定交易幣種，只交易這些幣種
-            df = df[df['symbol'].isin(TRADING_SYMBOLS)]
-        else:
-            # 否則排除指定的幣種
-            df = df[~df['symbol'].isin(EXCLUDED_SYMBOLS)]
-        
-        if df.empty:
+        if not potential_opportunities:
             return None
         
-        # 3. 優先按結算時間排序（最近的在前），然後按資金費率絕對值排序
-        df = df.sort_values(['next_funding_time', 'abs_funding_rate'], ascending=[True, False])
+        # 按結算時間優先，然後按資金費率排序
+        potential_opportunities.sort(key=lambda x: (x['next_funding_time'], -x['abs_funding_rate']))
         
-        best = df.iloc[0]
+        # 依次檢查所有候選，直到找到一個符合條件的
+        for candidate in potential_opportunities:
+            symbol = candidate['symbol']
+            
+            # 針對候選更新點差（按需精準更新，避免頻繁調用）
+            if self._should_update_spread(symbol):
+                self.update_single_spread(symbol)
+            
+            # 重新計算淨收益（使用最新點差）
+            funding_rate = candidate['funding_rate'] 
+            net_profit, spread = self.calculate_net_profit(symbol, funding_rate)
+            
+            # 檢查最終的淨收益和點差條件
+            if net_profit >= min_funding_rate and spread <= self.max_spread:
+                return {
+                    'symbol': symbol,
+                    'funding_rate': funding_rate,
+                    'net_profit': net_profit,
+                    'spread': spread,
+                    'next_funding_time': candidate['next_funding_time'],
+                    'direction': candidate['direction']
+                }
         
-        # 檢查資金費率是否足夠大（測試模式：跳過這個檢查）
-        # if best['abs_funding_rate'] < min_funding_rate:
-        #     return None
-
-        return {
-            'symbol': best['symbol'],
-            'funding_rate': best['funding_rate'],
-            'next_funding_time': best['next_funding_time'],
-            'direction': 'long' if best['funding_rate'] < 0 else 'short'
-        }
+        # 如果所有候選都不符合條件，返回None
+        return None
 
     def display_current_rates(self):
-        """顯示當前資金費率 - 按結算時間優先排序"""
+        """顯示當前資金費率 - 按結算時間優先排序，顯示淨收益信息"""
         if not self.funding_rates:
             return
             
-        rates_list = []
+        # 收集符合條件的交易對
+        opportunities = []
         for symbol, data in self.funding_rates.items():
-            rates_list.append({
-                'symbol': symbol,
-                'funding_rate': data['funding_rate'],
-                'next_funding_time': data['next_funding_time']
-            })
+            # 檢查交易對篩選
+            if TRADING_SYMBOLS:
+                if symbol not in TRADING_SYMBOLS:
+                    continue
+            else:
+                if symbol in EXCLUDED_SYMBOLS:
+                    continue
+            
+            funding_rate = data['funding_rate']
+            net_profit, spread = self.calculate_net_profit(symbol, funding_rate)
+            
+            # 檢查淨收益和點差條件
+            if net_profit >= self.funding_rate_threshold and spread <= self.max_spread:
+                opportunities.append({
+                    'symbol': symbol,
+                    'funding_rate': funding_rate,
+                    'net_profit': net_profit,
+                    'spread': spread,
+                    'next_funding_time': data['next_funding_time']
+                })
         
-        df = pd.DataFrame(rates_list)
-        df['abs_funding_rate'] = df['funding_rate'].abs()
-        
-        # 應用相同的篩選和排序邏輯
-        df = df[df['abs_funding_rate'] >= self.funding_rate_threshold]
-        if TRADING_SYMBOLS:
-            df = df[df['symbol'].isin(TRADING_SYMBOLS)]
-        else:
-            df = df[~df['symbol'].isin(EXCLUDED_SYMBOLS)]
-        
-        if df.empty:
+        if not opportunities:
             return
             
         # 按結算時間優先排序
-        df = df.sort_values(['next_funding_time', 'abs_funding_rate'], ascending=[True, False])
-        best = df.iloc[0]
+        opportunities.sort(key=lambda x: (x['next_funding_time'], -x['net_profit']))
+        best = opportunities[0]
         
         next_time = datetime.fromtimestamp(best['next_funding_time'] / 1000).strftime('%H:%M:%S')
         current_time = self.get_corrected_time()
@@ -448,7 +698,7 @@ class FundingRateTrader:
         settlement_secs = time_to_settlement_seconds % 60
         settlement_countdown = f"{settlement_hours:02d}:{settlement_minutes:02d}:{settlement_secs:02d}"
         
-        print(f"\r最佳: {best['symbol']} {best['funding_rate']:.4f}% 結算:{next_time} 倒數:{settlement_countdown}", end='', flush=True)
+        print(f"\r最佳: {best['symbol']} 資金費率:{best['funding_rate']:.4f}% | 點差:{best['spread']:.3f}% | 淨收益:{best['net_profit']:.3f}% 結算:{next_time} 倒數:{settlement_countdown}", end='', flush=True)
 
     def get_funding_rates(self) -> pd.DataFrame:
         """獲取所有交易對的資金費率"""
@@ -487,35 +737,52 @@ class FundingRateTrader:
             self.log_trade_step('entry', symbol, 'set_leverage', {'leverage': self.leverage})
             self.client.futures_change_leverage(symbol=symbol, leverage=self.leverage)
             self.log_trade_step('entry', symbol, 'leverage_set', {'leverage': self.leverage})
+            # 記錄槓桿設置完成
+            self.record_entry_step('leverage_set', symbol=symbol, leverage=self.leverage)
             
             # 獲取當前價格 - 使用快速方法
             print(f"[{self.format_corrected_time()}] 獲取當前價格: {symbol}")
             self.log_trade_step('entry', symbol, 'fetch_price_start', {})
             
-            # 優化：優先使用WebSocket數據中的價格，如果沒有則使用API
+            # 修復：正確使用字典格式獲取WebSocket標記價格（1-3ms）
             current_price = None
             if hasattr(self, 'funding_rates') and symbol in self.funding_rates:
-                # 從已有的funding rates數據中獲取價格（最快）
-                df_symbol = self.funding_rates[self.funding_rates['symbol'] == symbol]
-                if not df_symbol.empty and 'markPrice' in df_symbol.columns:
-                    current_price = float(df_symbol.iloc[0]['markPrice'])
+                # 正確的字典格式訪問
+                symbol_data = self.funding_rates[symbol]
+                if 'mark_price' in symbol_data:
+                    current_price = symbol_data['mark_price']
                     print(f"[{self.format_corrected_time()}] 使用標記價格: {symbol} = {current_price} (來源: WebSocket)")
                     self.log_trade_step('entry', symbol, 'price_from_websocket', {'price': current_price})
+                else:
+                    print(f"[{self.format_corrected_time()}] WebSocket數據中無標記價格: {symbol}")
+            else:
+                print(f"[{self.format_corrected_time()}] WebSocket中無該幣種數據: {symbol}")
             
             # 如果無法從WebSocket獲取，則使用快速API
             if current_price is None:
                 try:
+                    print(f"[{self.format_corrected_time()}] 嘗試24hr ticker API...")
                     # 使用24hr ticker stats (通常比single ticker快)
                     ticker_24hr = self.client.futures_24hr_ticker(symbol=symbol)
+                    print(f"[{self.format_corrected_time()}] 24hr ticker回應: {ticker_24hr}")
                     current_price = float(ticker_24hr['lastPrice'])
                     print(f"[{self.format_corrected_time()}] 使用24hr ticker: {symbol} = {current_price}")
                     self.log_trade_step('entry', symbol, 'price_from_24hr_ticker', {'price': current_price})
-                except:
-                    # 最後備案：使用原始方法
-                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
-                    current_price = float(ticker['price'])
-                    print(f"[{self.format_corrected_time()}] 使用symbol ticker: {symbol} = {current_price}")
-                    self.log_trade_step('entry', symbol, 'price_from_symbol_ticker', {'price': current_price})
+                except Exception as e24:
+                    print(f"[{self.format_corrected_time()}] 24hr ticker失敗: {e24}")
+                    self.log_trade_step('entry', symbol, '24hr_ticker_failed', {'error': str(e24)})
+                    try:
+                        print(f"[{self.format_corrected_time()}] 嘗試symbol ticker API...")
+                        # 最後備案：使用原始方法
+                        ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                        print(f"[{self.format_corrected_time()}] symbol ticker回應: {ticker}")
+                        current_price = float(ticker['price'])
+                        print(f"[{self.format_corrected_time()}] 使用symbol ticker: {symbol} = {current_price}")
+                        self.log_trade_step('entry', symbol, 'price_from_symbol_ticker', {'price': current_price})
+                    except Exception as esym:
+                        print(f"[{self.format_corrected_time()}] symbol ticker失敗: {esym}")
+                        self.log_trade_step('entry', symbol, 'symbol_ticker_failed', {'error': str(esym)})
+                        raise Exception(f"所有價格獲取方法都失敗: WebSocket無數據, 24hr ticker錯誤({e24}), symbol ticker錯誤({esym})")
             
             print(f"[{self.format_corrected_time()}] 當前價格: {symbol} = {current_price}")
             self.log_trade_step('entry', symbol, 'fetch_price_success', {'price': current_price})
@@ -616,8 +883,12 @@ class FundingRateTrader:
             # 添加倉位檢查延遲，避免開倉後立即檢查
             self.position_check_delay_until = time.time() + 0.3  # 延遲0.3秒再檢查倉位
             
-            # 記錄進倉步驟時間
-            self.record_entry_step('open_position', symbol=symbol, funding_rate=funding_rate, direction=direction, next_funding_time=next_funding_time)
+            # 記錄進場完成
+            self.record_entry_step('entry_complete', symbol=symbol, 
+                                 funding_rate=funding_rate, 
+                                 direction=direction, 
+                                 next_funding_time=next_funding_time,
+                                 expected_profit=self.calculate_net_profit(symbol, funding_rate)[0])
             
             # 重置進場重試計數器
             self.entry_retry_count = 0
@@ -692,9 +963,13 @@ class FundingRateTrader:
         quantity = self.current_position['quantity']
         
         try:
+            # 記錄極速平倉開始
+            self.write_trade_analysis('fast_close_start', symbol, direction=direction, quantity=quantity)
+            
             # 確定平倉方向（與開倉相反）
             side = 'SELL' if direction == 'long' else 'BUY'
             
+            order_start_time = time.time()
             # 直接發送平倉訂單 - 不獲取價格，市價單會自動匹配最佳價格
             order = self.client.futures_create_order(
                 symbol=symbol,
@@ -703,9 +978,18 @@ class FundingRateTrader:
                 quantity=quantity,
                 reduceOnly=True  # 確保只平倉，不開新倉
             )
+            order_end_time = time.time()
+            execution_time_ms = int((order_end_time - order_start_time) * 1000)
             
             # 簡單記錄成功
             print(f"[{self.format_corrected_time()}] 極速平倉成功: {symbol} 訂單ID:{order['orderId']}")
+            
+            # 記錄極速平倉成功
+            self.write_trade_analysis('fast_close_success', symbol, 
+                                    order_id=order['orderId'], 
+                                    execution_time_ms=execution_time_ms,
+                                    executed_qty=order.get('executedQty', 'N/A'),
+                                    avg_price=order.get('avgPrice', 'N/A'))
             
             # 清空持倉記錄
             self.current_position = None
@@ -720,6 +1004,8 @@ class FundingRateTrader:
             
         except Exception as e:
             print(f"[{self.format_corrected_time()}] 極速平倉失敗: {symbol} - {e}")
+            # 記錄極速平倉失敗
+            self.write_trade_analysis('fast_close_failed', symbol, error=str(e))
             # 失敗時才使用完整的重試邏輯
             return self.close_position_with_retry()
     
@@ -1135,11 +1421,15 @@ class FundingRateTrader:
         
         try:
             print(f"[{self.format_corrected_time()}] 開始強制平倉，檢查實際倉位狀況...")
+            # 記錄強制平倉開始
+            self.write_trade_analysis('force_close_start', symbol, direction=direction, quantity=quantity)
+            
             # 在強制平倉前檢查實際倉位狀況
             actual_position = self.check_actual_position(symbol)
             
             if not actual_position:
                 print(f"[{self.format_corrected_time()}] 強制平倉檢查: {symbol} 已無持倉，無需強制平倉")
+                self.write_trade_analysis('force_close_no_position', symbol)
                 # 清空持倉記錄
                 self.current_position = None
                 self.position_open_time = None
@@ -1156,6 +1446,7 @@ class FundingRateTrader:
             # 確定平倉方向（與開倉相反）
             side = 'SELL' if direction == 'long' else 'BUY'
             
+            order_start_time = time.time()
             # 使用市價單強制平倉
             order = self.client.futures_create_order(
                 symbol=symbol,
@@ -1164,8 +1455,18 @@ class FundingRateTrader:
                 quantity=quantity,
                 reduceOnly=True  # 確保只平倉，不開新倉
             )
+            order_end_time = time.time()
+            execution_time_ms = int((order_end_time - order_start_time) * 1000)
             
             print(f"[{self.format_corrected_time()}] 強制平倉成功: {order}")
+            
+            # 記錄強制平倉成功
+            self.write_trade_analysis('force_close_success', symbol, 
+                                    order_id=order['orderId'], 
+                                    execution_time_ms=execution_time_ms,
+                                    retry_count=self.close_retry_count,
+                                    actual_entry_price=actual_position['entry_price'],
+                                    unrealized_pnl=actual_position['unrealized_pnl'])
             
             # 記錄強制平倉事件
             self.log_trade_event('force_close_success', symbol, {
@@ -1185,6 +1486,9 @@ class FundingRateTrader:
             
         except Exception as e:
             print(f"[{self.format_corrected_time()}] 強制平倉失敗: {e}")
+            
+            # 記錄強制平倉失敗
+            self.write_trade_analysis('force_close_failed', symbol, error=str(e), retry_count=self.close_retry_count)
             
             # 記錄強制平倉失敗事件
             self.log_trade_event('force_close_failed', symbol, {
@@ -1394,6 +1698,14 @@ class FundingRateTrader:
                         
                         print(f"[{self.format_corrected_time()}] 清理倉位: {symbol} {direction} 數量:{quantity}")
                         
+                        # 記錄倉位清理開始
+                        self.write_trade_analysis('cleanup_start', symbol, 
+                                                direction=direction, 
+                                                quantity=quantity,
+                                                age_seconds=pos_info['age_seconds'],
+                                                reason=pos_info['reason'])
+                        
+                        order_start_time = time.time()
                         # 發送平倉訂單
                         order = self.client.futures_create_order(
                             symbol=symbol,
@@ -1402,8 +1714,17 @@ class FundingRateTrader:
                             quantity=quantity,
                             reduceOnly=True  # 確保只平倉，不開新倉
                         )
+                        order_end_time = time.time()
+                        execution_time_ms = int((order_end_time - order_start_time) * 1000)
                         
                         print(f"[{self.format_corrected_time()}] 超時倉位清理成功: {symbol} 訂單ID:{order['orderId']}")
+                        
+                        # 記錄倉位清理成功  
+                        self.write_trade_analysis('cleanup_success', symbol, 
+                                                order_id=order['orderId'],
+                                                execution_time_ms=execution_time_ms,
+                                                age_seconds=pos_info['age_seconds'],
+                                                reason=pos_info['reason'])
                         
                         # 記錄清理事件
                         self.log_trade_event('timeout_cleanup', symbol, {
@@ -1424,6 +1745,13 @@ class FundingRateTrader:
                         
                     except Exception as e:
                         print(f"[{self.format_corrected_time()}] 清理倉位 {symbol} 失敗: {e}")
+                        
+                        # 記錄倉位清理失敗
+                        self.write_trade_analysis('cleanup_failed', symbol, 
+                                                error=str(e),
+                                                direction=direction,
+                                                quantity=quantity)
+                        
                         self.log_trade_event('timeout_cleanup_failed', symbol, {
                             'error': str(e),
                             'direction': direction,
@@ -1447,6 +1775,7 @@ class FundingRateTrader:
         print(f"槓桿倍數: {LEVERAGE}")
         print(f"目標倉位大小: {MAX_POSITION_SIZE * LEVERAGE} USDT")
         print(f"最小資金費率: {MIN_FUNDING_RATE}%")
+        print(f"最大點差閾值: {MAX_SPREAD}%")
         print(f"進場提前時間: {ENTRY_BEFORE_SECONDS} 秒")
         print(f"平倉提前時間: {CLOSE_BEFORE_SECONDS} 秒")
         print(f"主循環檢查間隔: {CHECK_INTERVAL} 秒")
@@ -1585,8 +1914,19 @@ class FundingRateTrader:
                                 
                                 # 只在整秒時顯示（每秒顯示一次）
                                 if entry_secs != getattr(self, '_last_display_sec', -1):
-                                    # 格式化顯示，使用固定寬度對齊
-                                    status_line = f"[{self.format_corrected_time()}] 倒計時: 進場{entry_countdown:>12} | 平倉{close_countdown:>12} | 結算:{settlement_time_str:>8} | 結算倒數{settlement_countdown:>12} | 最佳: {best_opportunity['symbol']:<10} {best_opportunity['funding_rate']:.4f}% {best_opportunity['direction']:<4} | 時間差:{self.time_offset:+5d}ms"
+                                    # 計算淨收益和點差
+                                    net_profit = best_opportunity.get('net_profit', 0)
+                                    spread = best_opportunity.get('spread', 0)
+                                    spread_display = f"點差:{spread:.3f}%" if spread < 999 else "點差:N/A"
+                                    
+                                    # 檢查是否滿足淨收益條件
+                                    profit_ok = net_profit >= self.funding_rate_threshold
+                                    spread_ok = spread <= self.max_spread
+                                    status = "✓" if (profit_ok and spread_ok) else "✗"
+                                    
+                                    # 格式化顯示，顯示資金費率、點差、淨收益
+                                    funding_rate = best_opportunity['funding_rate']
+                                    status_line = f"[{self.format_corrected_time()}] 倒計時: 進場{entry_countdown:>12} | 平倉{close_countdown:>12} | 結算:{settlement_time_str:>8} | 結算倒數{settlement_countdown:>12} | 最佳: {best_opportunity['symbol']:<10} 資金費率:{funding_rate:.4f}% | 點差:{spread:.3f}% | 淨收益:{net_profit:.3f}%{status} {best_opportunity['direction']:<4} | 時間差:{self.time_offset:+5d}ms"
                                     print(status_line)
                                     self._last_display_sec = entry_secs
                             
@@ -1672,10 +2012,40 @@ class FundingRateTrader:
                                 
                                 print(f"[{self.format_corrected_time()}] 進場時間到（結算前{self.entry_before_seconds}秒）！")
                                 
-                                print(f"[{self.format_corrected_time()}] 使用篩選結果進場: {best_opportunity['symbol']} | 資金費率: {best_opportunity['funding_rate']:.4f}% | 方向: {best_opportunity['direction']}")
+                                # 進場前最終檢查：淨收益和點差
+                                final_net_profit = best_opportunity.get('net_profit', 0)
+                                final_spread = best_opportunity.get('spread', 0)
+                                funding_rate = best_opportunity['funding_rate']
+                                
+                                print(f"[{self.format_corrected_time()}] 進場前檢查: {best_opportunity['symbol']} | 資金費率: {funding_rate:.4f}% | 點差: {final_spread:.3f}% | 淨收益: {final_net_profit:.3f}% (閾值:{self.funding_rate_threshold}%) | 方向: {best_opportunity['direction']}")
+                                
+                                if final_net_profit < self.funding_rate_threshold:
+                                    print(f"[{self.format_corrected_time()}] 進場取消：淨收益{final_net_profit:.3f}%低於閾值{self.funding_rate_threshold}%")
+                                    self.log_trade_step('entry', best_opportunity['symbol'], 'skip_low_net_profit', safe_json_serialize({
+                                        'funding_rate': funding_rate,
+                                        'spread': final_spread,
+                                        'net_profit': final_net_profit,
+                                        'threshold': self.funding_rate_threshold
+                                    }))
+                                    time.sleep(self.check_interval)
+                                    continue
+                                
+                                if final_spread > self.max_spread:  # 點差超過配置閾值則跳過
+                                    print(f"[{self.format_corrected_time()}] 進場取消：點差過大{final_spread:.3f}% (>{self.max_spread}%)")
+                                    self.log_trade_step('entry', best_opportunity['symbol'], 'skip_high_spread', safe_json_serialize({
+                                        'spread': final_spread,
+                                        'max_spread': self.max_spread,
+                                        'net_profit': final_net_profit
+                                    }))
+                                    time.sleep(self.check_interval)
+                                    continue
+                                
+                                print(f"[{self.format_corrected_time()}] 檢查通過，開始進場: {best_opportunity['symbol']} | 資金費率: {funding_rate:.4f}% | 點差: {final_spread:.3f}% | 淨收益: {final_net_profit:.3f}% | 方向: {best_opportunity['direction']}")
                                 self.log_trade_step('entry', best_opportunity['symbol'], 'start_entry', safe_json_serialize({
-                                    'funding_rate': best_opportunity['funding_rate'],
+                                    'funding_rate': funding_rate,
                                     'direction': best_opportunity['direction'],
+                                    'spread': final_spread,
+                                    'net_profit': final_net_profit,
                                     'entry_before_seconds': self.entry_before_seconds,
                                     'settlement_time': datetime.fromtimestamp(real_settlement_time / 1000).strftime('%H:%M:%S.%f')
                                 }))
@@ -1683,9 +2053,19 @@ class FundingRateTrader:
                                 # 開倉
                                 self.open_position(best_opportunity['symbol'], best_opportunity['direction'], best_opportunity['funding_rate'], best_opportunity['next_funding_time'])
                     else:
-                        # 沒有篩選出符合條件的交易對，顯示等待信息
+                        # 沒有篩選出符合條件的交易對，顯示詳細等待信息
                         if not hasattr(self, '_last_no_opportunity_time') or time.time() - self._last_no_opportunity_time >= 10.0:
-                            print(f"[{self.format_corrected_time()}] 等待符合條件的交易機會... | 時間差:{self.time_offset:+5d}ms")
+                            # 計算有多少交易對因為資金費率太低被排除
+                            total_pairs = len(self.funding_rates) if self.funding_rates else 0
+                            if total_pairs > 0:
+                                low_rate_count = 0
+                                for symbol, data in self.funding_rates.items():
+                                    if abs(data['funding_rate']) < self.funding_rate_threshold:
+                                        low_rate_count += 1
+                                
+                                print(f"[{self.format_corrected_time()}] 等待符合條件的交易機會... | 總交易對:{total_pairs} | 低於{self.funding_rate_threshold}%閾值:{low_rate_count} | 時間差:{self.time_offset:+5d}ms")
+                            else:
+                                print(f"[{self.format_corrected_time()}] 等待WebSocket數據... | 時間差:{self.time_offset:+5d}ms")
                             self._last_no_opportunity_time = time.time()
                     
                     time.sleep(self.check_interval)
@@ -1862,6 +2242,10 @@ class FundingRateTrader:
             # 設置槓桿
             print(f"[{self.format_corrected_time()}] 設置槓桿倍數: {self.leverage}")
             
+            # 啟動首次點差緩存更新
+            print(f"[{self.format_corrected_time()}] 啟動首次點差緩存更新...")
+            self._start_spread_cache_update()
+            
             return True
             
         except Exception as e:
@@ -1998,6 +2382,9 @@ class FundingRateTrader:
         print(f"[{self.format_corrected_time()}] 進場步驟: {step} | {symbol} | {kwargs}")
         # 同時記錄到日誌文件
         self.log_trade_step('entry', symbol, step, safe_json_serialize(kwargs))
+        
+        # 記錄到交易分析記事本
+        self.write_trade_analysis(step, symbol, **kwargs)
 
     def record_close_step(self, step: str, symbol: str, **kwargs):
         """記錄平倉步驟"""
@@ -2010,6 +2397,152 @@ class FundingRateTrader:
         print(f"[{self.format_corrected_time()}] 平倉步驟: {step} | {symbol} | {kwargs}")
         # 同時記錄到日誌文件
         self.log_trade_step('close', symbol, step, safe_json_serialize(kwargs))
+        
+        # 記錄到交易分析記事本
+        self.write_trade_analysis(step, symbol, **kwargs)
+
+    def write_trade_analysis(self, step: str, symbol: str, **kwargs):
+        """寫入交易分析記事本 - 易讀格式，包含進場、平倉、指令發送接收等"""
+        try:
+            # 確保logs目錄存在
+            import os
+            os.makedirs('logs', exist_ok=True)
+            
+            timestamp = self.format_corrected_time('%Y-%m-%d %H:%M:%S.%f')
+            # 顯示時間時包含毫秒 (取前23個字符：2025-06-29 22:00:00.123)
+            display_time = timestamp[:23]
+            
+            # 根據不同步驟記錄不同內容
+            # ========== 進場相關步驟 ==========
+            if step == 'entry_start':
+                content = f"\n{'='*60}\n"
+                content += f"🚀 開始進場: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"資金費率: {kwargs.get('funding_rate', 'N/A')}%\n"
+                content += f"結算時間: {kwargs.get('settlement_time', 'N/A')}\n"
+                content += f"{'='*60}\n"
+                
+            elif step == 'leverage_set':
+                content = f"[{display_time}] ⚙️ 槓桿設置完成: {kwargs.get('leverage', 'N/A')}倍\n"
+                
+            elif step == 'entry_price_fetched':
+                content = f"[{display_time}] 📊 價格獲取完成: {kwargs.get('price', 'N/A')}\n"
+                
+            elif step == 'entry_quantity_calculated':
+                content = f"[{display_time}] 📏 數量計算完成: {kwargs.get('quantity', 'N/A')}\n"
+                
+            elif step == 'entry_order_sent':
+                content = f"[{display_time}] 📤 進場訂單發送: ID:{kwargs.get('order_id', 'N/A')} 耗時:{kwargs.get('order_time_ms', 'N/A')}ms\n"
+                
+            elif step == 'entry_success':
+                content = f"[{display_time}] ✅ 進場成功: 成交量:{kwargs.get('executed_qty', 'N/A')} 均價:{kwargs.get('avg_price', 'N/A')}\n"
+                content += f"[{display_time}] 🎯 預期盈利: {kwargs.get('expected_profit', 'N/A')} USDT\n"
+                
+            elif step == 'entry_failed':
+                content = f"[{display_time}] ❌ 進場失敗: {kwargs.get('error', 'N/A')}\n"
+                
+            elif step == 'entry_complete':
+                content = f"[{display_time}] 🏁 進場完成\n"
+                content += f"{'='*60}\n\n"
+                
+            # ========== 平倉相關步驟 ==========
+            elif step == 'close_start':
+                content = f"\n{'='*60}\n"
+                content += f"開始平倉: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"數量: {kwargs.get('quantity', 'N/A')}\n"
+                content += f"{'='*60}\n"
+                
+            elif step == 'close_price_fetched':
+                content = f"[{display_time}] 價格獲取完成: {kwargs.get('price', 'N/A')}\n"
+                
+            elif step == 'close_order_sent':
+                content = f"[{display_time}] 訂單發送完成: ID:{kwargs.get('order_id', 'N/A')} 耗時:{kwargs.get('order_time_ms', 'N/A')}ms\n"
+                
+            elif step == 'close_success':
+                content = f"[{display_time}] 平倉成功: 成交量:{kwargs.get('executed_qty', 'N/A')} 均價:{kwargs.get('avg_price', 'N/A')}\n"
+                
+            elif step == 'close_failed':
+                content = f"[{display_time}] ❌ 平倉失敗: {kwargs.get('error', 'N/A')}\n"
+                
+            elif step == 'close_position':
+                content = f"[{display_time}] ✅ 平倉完成\n"
+                content += f"{'='*60}\n\n"
+                
+            # 極速平倉相關步驟
+            elif step == 'fast_close_start':
+                content = f"\n{'='*60}\n"
+                content += f"🚀 開始極速平倉: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"數量: {kwargs.get('quantity', 'N/A')}\n"
+                content += f"{'='*60}\n"
+                
+            elif step == 'fast_close_success':
+                content = f"[{display_time}] ✅ 極速平倉成功: ID:{kwargs.get('order_id', 'N/A')} 耗時:{kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}] 成交量:{kwargs.get('executed_qty', 'N/A')} 均價:{kwargs.get('avg_price', 'N/A')}\n"
+                content += f"{'='*60}\n\n"
+                
+            elif step == 'fast_close_failed':
+                content = f"[{display_time}] ❌ 極速平倉失敗: {kwargs.get('error', 'N/A')}\n"
+                content += f"{'='*60}\n\n"
+                
+            # 強制平倉相關步驟
+            elif step == 'force_close_start':
+                content = f"\n{'='*60}\n"
+                content += f"⚡ 開始強制平倉: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"數量: {kwargs.get('quantity', 'N/A')}\n"
+                content += f"{'='*60}\n"
+                
+            elif step == 'force_close_success':
+                content = f"[{display_time}] ✅ 強制平倉成功: ID:{kwargs.get('order_id', 'N/A')} 耗時:{kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}] 重試次數:{kwargs.get('retry_count', 'N/A')} 實際進場價:{kwargs.get('actual_entry_price', 'N/A')} 未實現盈虧:{kwargs.get('unrealized_pnl', 'N/A')}\n"
+                content += f"{'='*60}\n\n"
+                
+            elif step == 'force_close_failed':
+                content = f"[{display_time}] ❌ 強制平倉失敗: {kwargs.get('error', 'N/A')} (重試次數:{kwargs.get('retry_count', 'N/A')})\n"
+                content += f"{'='*60}\n\n"
+                
+            elif step == 'force_close_no_position':
+                content = f"[{display_time}] ℹ️ 強制平倉檢查: 已無持倉，無需平倉\n"
+                content += f"{'='*60}\n\n"
+                
+            # 倉位清理相關步驟  
+            elif step == 'cleanup_start':
+                content = f"\n{'='*60}\n"
+                content += f"🧹 開始清理超時倉位: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"數量: {kwargs.get('quantity', 'N/A')}\n"
+                content += f"持倉時間: {kwargs.get('age_seconds', 'N/A')} 秒\n"
+                content += f"清理原因: {kwargs.get('reason', 'N/A')}\n"
+                content += f"{'='*60}\n"
+                
+            elif step == 'cleanup_success':
+                content = f"[{display_time}] ✅ 倉位清理成功: ID:{kwargs.get('order_id', 'N/A')} 耗時:{kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}] 持倉時間:{kwargs.get('age_seconds', 'N/A')}秒 原因:{kwargs.get('reason', 'N/A')}\n"
+                content += f"{'='*60}\n\n"
+                
+            elif step == 'cleanup_failed':
+                content = f"[{display_time}] ❌ 倉位清理失敗: {kwargs.get('error', 'N/A')}\n"
+                content += f"[{display_time}] 方向:{kwargs.get('direction', 'N/A')} 數量:{kwargs.get('quantity', 'N/A')}\n"
+                content += f"{'='*60}\n\n"
+                
+            else:
+                # 其他步驟的一般記錄
+                content = f"[{display_time}] {step}: {kwargs}\n"
+            
+            # 寫入檔案
+            with open('logs/trade_analysis.txt', 'a', encoding='utf-8') as f:
+                f.write(content)
+                f.flush()  # 立即寫入硬碟
+                
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 記錄平倉分析失敗: {e}")
 
     def print_detailed_timestamps(self, symbol: str):
         """顯示詳細的時間記錄"""

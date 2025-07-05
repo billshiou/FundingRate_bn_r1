@@ -128,7 +128,8 @@ logs/*.txt
 
 # 交易數據
 *.csv
-*.json
+trade_history.json
+trade_*.json
 data/
 backup/
 

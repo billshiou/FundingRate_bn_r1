@@ -528,6 +528,14 @@ class ProfitTracker:
     
     def send_trade_notification(self, trade_data: Dict):
         """發送交易通知"""
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] send_trade_notification 被調用")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] NOTIFY_ON_TRADE = {NOTIFY_ON_TRADE}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ENABLE_TELEGRAM_NOTIFY = {ENABLE_TELEGRAM_NOTIFY}")
+        
+        if not NOTIFY_ON_TRADE:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 交易通知已禁用，退出")
+            return
+            
         message = self.format_trade_message(trade_data)
         self.send_telegram_message(message)
     
@@ -643,4 +651,74 @@ class ProfitTracker:
             return filename
         except Exception as e:
             print(f"導出 CSV 失敗: {e}")
-            return None 
+            return None
+    
+    def export_daily_excel_summary(self, date: str = None) -> bool:
+        """導出每日交易總結到Excel"""
+        try:
+            from excel_exporter import ExcelTradeExporter
+            
+            if not date:
+                date = datetime.now().strftime('%Y-%m-%d')
+            
+            # 獲取當日統計數據
+            daily_stats = self.get_daily_stats()
+            
+            # 創建Excel導出器
+            exporter = ExcelTradeExporter()
+            
+            # 導出數據
+            success = exporter.export_daily_summary(date, daily_stats)
+            
+            if success:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 每日Excel總結已導出: {date}")
+                return True
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Excel導出失敗: {date}")
+                return False
+                
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Excel導出異常: {e}")
+            return False
+    
+    def setup_daily_excel_export(self):
+        """設置每日Excel導出定時任務"""
+        try:
+            import schedule
+            import threading
+            
+            # 每天晚上23:59導出當日數據
+            schedule.every().day.at("23:59").do(self.export_daily_excel_summary)
+            
+            def run_scheduler():
+                while True:
+                    schedule.run_pending()
+                    time.sleep(60)  # 每分鐘檢查一次
+            
+            # 在背景執行定時任務
+            scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+            scheduler_thread.start()
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏰ 每日Excel導出定時任務已啟動 (每日23:59)")
+            
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 設置定時任務失敗: {e}")
+    
+    def export_historical_excel_data(self, days: int = 30) -> bool:
+        """導出歷史數據到Excel（用於初始化）"""
+        try:
+            from excel_exporter import ExcelTradeExporter
+            
+            exporter = ExcelTradeExporter()
+            success = exporter.export_historical_data(days)
+            
+            if success:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 歷史數據已導出到Excel ({days}天)")
+                return True
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 歷史數據導出失敗")
+                return False
+                
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 歷史數據導出異常: {e}")
+            return False 

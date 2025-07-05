@@ -26,4 +26,5 @@ psutil>=5.9.0
 colorama>=0.4.6
 
 jupyter>=1.0.0
-ipython>=8.0.0 
+ipython>=8.0.0
+openpyxl>=3.1.0 

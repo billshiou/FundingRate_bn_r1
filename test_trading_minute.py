@@ -759,8 +759,7 @@ class FundingRateTrader:
             self.log_trade_step('entry', symbol, 'set_leverage', {'leverage': self.leverage})
             self.client.futures_change_leverage(symbol=symbol, leverage=self.leverage)
             self.log_trade_step('entry', symbol, 'leverage_set', {'leverage': self.leverage})
-            # 記錄槓桿設置完成
-            self.record_entry_step('leverage_set', symbol=symbol, leverage=self.leverage)
+            # 記錄槓桿設置完成（已在上面log_trade_step記錄，避免重複）
             
             # 獲取當前價格 - 使用快速方法
             print(f"[{self.format_corrected_time()}] 獲取當前價格: {symbol}")
@@ -1287,7 +1286,7 @@ class FundingRateTrader:
                     exit_price = order_exit_price
                     print(f"[{self.format_corrected_time()}] 使用訂單成交價: {exit_price}")
                 else:
-                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                ticker = self.client.futures_symbol_ticker(symbol=symbol)
                     exit_price = float(ticker['price'])
                     print(f"[{self.format_corrected_time()}] 重新獲取市價: {exit_price}")
                 
@@ -2485,9 +2484,9 @@ class FundingRateTrader:
             
             # 統一檢查機制 - 簡化版本
             check_interval = self.account_check_interval  # 使用統一的檢查間隔
-            if not hasattr(self, '_last_normal_check_msg') or current_time - getattr(self, '_last_normal_check_msg', 0) >= 300:
+                if not hasattr(self, '_last_normal_check_msg') or current_time - getattr(self, '_last_normal_check_msg', 0) >= 300:
                 print(f"[{self.format_corrected_time()}] 定期檢查（每{check_interval}秒）...")
-                self._last_normal_check_msg = current_time
+                    self._last_normal_check_msg = current_time
             
             # 檢查是否到了檢查時間
             if not hasattr(self, 'last_account_check_time'):
@@ -2819,12 +2818,12 @@ class FundingRateTrader:
                                 # 格式化平倉倒數計時（結算後平倉）
                                 if time_to_close > 0:
                                     # 結算後平倉：顯示到平倉時間的倒數
-                                    close_seconds_total = int(time_to_close / 1000)
-                                    close_hours = close_seconds_total // 3600
-                                    close_minutes = (close_seconds_total % 3600) // 60
-                                    close_secs = close_seconds_total % 60
-                                    close_milliseconds = int(time_to_close % 1000)
-                                    close_countdown = f"{close_hours:02d}:{close_minutes:02d}:{close_secs:02d}.{close_milliseconds:03d}"
+                                close_seconds_total = int(time_to_close / 1000)
+                                close_hours = close_seconds_total // 3600
+                                close_minutes = (close_seconds_total % 3600) // 60
+                                close_secs = close_seconds_total % 60
+                                close_milliseconds = int(time_to_close % 1000)
+                                close_countdown = f"{close_hours:02d}:{close_minutes:02d}:{close_secs:02d}.{close_milliseconds:03d}"
                                 else:
                                     # 已過平倉時間
                                     close_countdown = "00:00:00.000"

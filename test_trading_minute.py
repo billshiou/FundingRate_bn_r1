@@ -164,7 +164,19 @@ def get_log_stats(log_dir='logs'):
 
 class FundingRateTrader:
     def __init__(self):
-        self.client = Client(API_KEY, API_SECRET)
+        # 配置API客戶端超時設置
+        self.client = Client(
+            API_KEY, 
+            API_SECRET,
+            requests_params={
+                'timeout': 10,  # 設置10秒超時
+                'verify': True,  # 啟用SSL驗證
+                'pool_connections': 10,  # 連接池大小
+                'pool_maxsize': 10,  # 最大連接數
+                'max_retries': 3,  # 最大重試次數
+                'backoff_factor': 0.3  # 重試間隔因子
+            }
+        )
         self.max_position_size = MAX_POSITION_SIZE
         self.leverage = LEVERAGE
         self.min_funding_rate = MIN_FUNDING_RATE
@@ -183,12 +195,17 @@ class FundingRateTrader:
         self.ws = None
         self.ws_thread = None
         self.running = False
+        # 配置CCXT交易所實例也添加超時設置
         self.exchange = ccxt.binance({
             'apiKey': API_KEY,
             'secret': API_SECRET,
             'enableRateLimit': True,
+            'timeout': 10000,  # 10秒超時（毫秒）
             'options': {
                 'defaultType': 'future',
+            },
+            'headers': {
+                'User-Agent': 'FundingRateBot/1.0'
             }
         })
         self.logger = self._setup_logger()
@@ -245,6 +262,15 @@ class FundingRateTrader:
         self._spread_cache = {}                    # 存儲每個交易對的點差
         self._spread_cache_time = {}               # 存儲每個交易對的更新時間
         self._spread_update_in_progress = False    # 批量更新進度標志（保留兼容性）
+        
+        # 🔒 併發保護機制
+        self.api_call_lock = threading.Lock()  # API調用鎖定
+        self.retry_state_lock = threading.Lock()  # 重試狀態鎖定
+        self.is_api_calling = False  # API調用狀態
+        self.api_call_start_time = 0  # API調用開始時間
+        self.max_api_call_duration = 15  # 最大API調用時間（秒）
+        self.concurrent_api_calls = 0  # 當前併發API調用數
+        self.max_concurrent_api_calls = 1  # 最大併發API調用數
         
         # 🎯 確定當前平倉模式 (用於顯示)
         self._close_method_display = self._determine_close_method_display()
@@ -838,11 +864,15 @@ class FundingRateTrader:
                 'type': 'MARKET'
             })
             order_start_time = time.time()
-            order = self.client.futures_create_order(
+            # 使用超時處理的API調用
+            order = self.execute_api_call_with_timeout(
+                self.client.futures_create_order,
                 symbol=symbol,
                 side=side,
                 type='MARKET',
-                quantity=quantity
+                quantity=quantity,
+                timeout=10,  # 10秒超時
+                max_retries=2  # 最多重試2次
             )
             order_end_time = time.time()
             execution_time_ms = int((order_end_time - order_start_time) * 1000)
@@ -1033,9 +1063,14 @@ class FundingRateTrader:
             }
             api_prepare_time_ms = int((time.time() - api_prepare_start) * 1000)
             
-            # 核心操作：直接發送平倉訂單
+            # 核心操作：直接發送平倉訂單 (使用超時處理)
             order_start_time = time.time()
-            order = self.client.futures_create_order(**order_params)
+            order = self.execute_api_call_with_timeout(
+                self.client.futures_create_order,
+                timeout=8,  # 8秒超時（平倉更急迫）
+                max_retries=1,  # 極速平倉只重試1次
+                **order_params
+            )
             order_end_time = time.time()
             
             # 時間分析
@@ -1195,8 +1230,13 @@ class FundingRateTrader:
                                     api_endpoint='futures_create_order')
             
             order_start_time = time.time()
-            # 直接發送平倉訂單 - 不獲取價格，市價單會自動匹配最佳價格
-            order = self.client.futures_create_order(**api_params)
+            # 直接發送平倉訂單 - 不獲取價格，市價單會自動匹配最佳價格 (使用超時處理)
+            order = self.execute_api_call_with_timeout(
+                self.client.futures_create_order,
+                timeout=10,  # 10秒超時
+                max_retries=2,  # 極速平倉重試2次
+                **api_params
+            )
             order_end_time = time.time()
             execution_time_ms = int((order_end_time - order_start_time) * 1000)
             
@@ -1286,7 +1326,7 @@ class FundingRateTrader:
                     exit_price = order_exit_price
                     print(f"[{self.format_corrected_time()}] 使用訂單成交價: {exit_price}")
                 else:
-                ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
                     exit_price = float(ticker['price'])
                     print(f"[{self.format_corrected_time()}] 重新獲取市價: {exit_price}")
                 
@@ -1341,6 +1381,17 @@ class FundingRateTrader:
                 
                 # 收益追蹤和Telegram通知
                 if hasattr(self, 'profit_tracker') and self.profit_tracker:
+                    # 從訂單響應中提取更準確的時間戳
+                    order_time_from_api = order.get('updateTime') or order.get('time')
+                    
+                    # 使用API時間戳（如果有的話），否則使用程式記錄的時間
+                    if order_time_from_api:
+                        exit_timestamp_ms = int(order_time_from_api)
+                        print(f"[{self.format_corrected_time()}] 使用API時間戳: {exit_timestamp_ms}")
+                    else:
+                        exit_timestamp_ms = int(order_time * 1000)
+                        print(f"[{self.format_corrected_time()}] 使用程式時間戳: {exit_timestamp_ms}")
+                    
                     trade_data = {
                         'symbol': symbol,
                         'direction': direction,
@@ -1351,8 +1402,12 @@ class FundingRateTrader:
                         'funding_rate': funding_rate,
                         'order_id': order_id,
                         'entry_timestamp': int(position_open_time_backup * 1000) if position_open_time_backup else int((order_time - 10) * 1000),
-                        'exit_timestamp': int(order_time * 1000),
-                        'position_duration_seconds': position_duration
+                        'exit_timestamp': exit_timestamp_ms,
+                        'position_duration_seconds': position_duration,
+                        # 添加額外的時間精度信息
+                        'api_order_time': order_time_from_api,
+                        'program_order_time': int(order_time * 1000),
+                        'time_source': 'api' if order_time_from_api else 'program'
                     }
                     
                     print(f"[{self.format_corrected_time()}] 交易資料準備: {trade_data}")
@@ -1884,7 +1939,13 @@ class FundingRateTrader:
             }))
             
             order_start_time = time.time()
-            order = self.client.futures_create_order(**order_params)
+            # 使用超時處理的API調用
+            order = self.execute_api_call_with_timeout(
+                self.client.futures_create_order,
+                timeout=12,  # 完整平倉允許更長超時
+                max_retries=3,  # 完整平倉重試3次
+                **order_params
+            )
             order_end_time = time.time()
             execution_time_ms = int((order_end_time - order_start_time) * 1000)
             
@@ -2484,9 +2545,9 @@ class FundingRateTrader:
             
             # 統一檢查機制 - 簡化版本
             check_interval = self.account_check_interval  # 使用統一的檢查間隔
-                if not hasattr(self, '_last_normal_check_msg') or current_time - getattr(self, '_last_normal_check_msg', 0) >= 300:
+            if not hasattr(self, '_last_normal_check_msg') or current_time - getattr(self, '_last_normal_check_msg', 0) >= 300:
                 print(f"[{self.format_corrected_time()}] 定期檢查（每{check_interval}秒）...")
-                    self._last_normal_check_msg = current_time
+                self._last_normal_check_msg = current_time
             
             # 檢查是否到了檢查時間
             if not hasattr(self, 'last_account_check_time'):
@@ -2721,6 +2782,17 @@ class FundingRateTrader:
                             print(f"[{self.format_corrected_time()}] 更新資金費率: {updated_count} 個交易對")
                         self._last_funding_update_time = time.time()
                     
+                    # 🔒 併發安全檢查：如果API調用正在進行，跳過非關鍵操作
+                    if self.is_api_calling:
+                        api_duration = time.time() - self.api_call_start_time
+                        if api_duration < self.max_api_call_duration:
+                            # API調用正在進行且未超時，跳過非關鍵操作
+                            time.sleep(0.1)  # 短暫等待
+                            continue
+                        else:
+                            # API調用可能卡住，記錄警告但繼續執行
+                            print(f"[{self.format_corrected_time()}] ⚠️ 檢測到長時間API調用，已運行{api_duration:.1f}秒")
+                    
                     # 檢查持倉狀態
                     self.check_position()
                     
@@ -2729,7 +2801,8 @@ class FundingRateTrader:
                     
                     # 添加調試信息（每10秒顯示一次）
                     if not hasattr(self, '_last_debug_time') or time.time() - self._last_debug_time >= 10:
-                        print(f"[DEBUG] 主循環狀態: 持倉={self.current_position is not None}, 平倉中={self.is_closing}, 資金費率數量={len(self.funding_rates)}")
+                        api_status = "進行中" if self.is_api_calling else "空閒"
+                        print(f"[DEBUG] 主循環狀態: 持倉={self.current_position is not None}, 平倉中={self.is_closing}, API狀態={api_status}, 資金費率數量={len(self.funding_rates)}")
                         self._last_debug_time = time.time()
                     
                     # 🎯 **優先檢查當前持倉的平倉時機** - 獨立於最佳機會
@@ -2754,29 +2827,50 @@ class FundingRateTrader:
                                     'settlement_time': datetime.fromtimestamp(current_position_settlement_time / 1000).strftime('%H:%M:%S.%f'),
                                     'trigger_source': 'independent_position_check'
                                 }))
+                                
+                                # 🔒 平倉前併發檢查
+                                if self.is_api_calling:
+                                    print(f"[{self.format_corrected_time()}] 檢測到API調用進行中，但平倉是優先操作，等待完成")
+                                    self.log_trade_step('close', symbol, 'wait_for_api_completion', {
+                                        'api_call_duration': time.time() - self.api_call_start_time
+                                    })
+                                    # 平倉是緊急操作，短暫等待後繼續
+                                    time.sleep(0.1)
+                                
                                 self.is_closing = True
                                 self.close_position()
                                 time.sleep(self.check_interval)
                                 continue
                             
-                            # 檢查是否需要備用強制平倉
+                            # 檢查是否需要備用強制平倉（第2層：結算後1秒檢查）
                             time_to_settlement = current_position_settlement_time - current_time_ms
                             if time_to_settlement <= 0:
-                                # 🔧 修復：只有在主要平倉時間(0.4s)過後才觸發備用強制平倉
-                                # 確保備用強制平倉不會在主要平倉時間之前觸發
+                                # 計算結算後經過的時間
                                 time_since_settlement = abs(time_to_settlement) / 1000  # 轉換為秒
-                                if time_since_settlement >= max(self.close_after_seconds + 0.1, self.force_close_after_seconds):
+                                
+                                # 🎯 第2層檢查：結算後1秒，有持倉就執行強制平倉
+                                if time_since_settlement >= self.force_close_after_seconds:
                                     symbol = self.current_position['symbol']
-                                    print(f"\n[{self.format_corrected_time()}] 🚨 持倉備用強制平倉：主要平倉未執行，結算後{time_since_settlement:.3f}秒強制平倉")
-                                    self.log_trade_step('close', symbol, 'independent_backup_force_close', safe_json_serialize({
+                                    print(f"\n[{self.format_corrected_time()}] 🚨 第2層強制平倉觸發：結算後{time_since_settlement:.3f}秒，檢查到持倉執行強制平倉")
+                                    self.log_trade_step('close', symbol, 'layer2_independent_force_close', safe_json_serialize({
                                         'time_to_settlement': time_to_settlement,
                                         'time_since_settlement': time_since_settlement,
                                         'close_after_seconds': self.close_after_seconds,
                                         'force_close_after_seconds': self.force_close_after_seconds,
                                         'settlement_time': datetime.fromtimestamp(current_position_settlement_time / 1000).strftime('%H:%M:%S.%f'),
-                                        'reason': '獨立檢查：主要平倉邏輯未執行，備用強制平倉',
+                                        'reason': '第2層平倉機制：結算後1秒檢查到持倉',
                                         'trigger_source': 'independent_position_check'
                                     }))
+                                    
+                                    # 🔒 強制平倉前併發檢查
+                                    if self.is_api_calling:
+                                        print(f"[{self.format_corrected_time()}] 檢測到API調用進行中，但強制平倉是最優先操作，等待完成")
+                                        self.log_trade_step('close', symbol, 'force_wait_for_api_completion', {
+                                            'api_call_duration': time.time() - self.api_call_start_time
+                                        })
+                                        # 強制平倉是最緊急操作，短暫等待後繼續
+                                        time.sleep(0.1)
+                                    
                                     self.is_closing = True
                                     self.force_close_position()
                                     time.sleep(self.check_interval)
@@ -2818,12 +2912,12 @@ class FundingRateTrader:
                                 # 格式化平倉倒數計時（結算後平倉）
                                 if time_to_close > 0:
                                     # 結算後平倉：顯示到平倉時間的倒數
-                                close_seconds_total = int(time_to_close / 1000)
-                                close_hours = close_seconds_total // 3600
-                                close_minutes = (close_seconds_total % 3600) // 60
-                                close_secs = close_seconds_total % 60
-                                close_milliseconds = int(time_to_close % 1000)
-                                close_countdown = f"{close_hours:02d}:{close_minutes:02d}:{close_secs:02d}.{close_milliseconds:03d}"
+                                    close_seconds_total = int(time_to_close / 1000)
+                                    close_hours = close_seconds_total // 3600
+                                    close_minutes = (close_seconds_total % 3600) // 60
+                                    close_secs = close_seconds_total % 60
+                                    close_milliseconds = int(time_to_close % 1000)
+                                    close_countdown = f"{close_hours:02d}:{close_minutes:02d}:{close_secs:02d}.{close_milliseconds:03d}"
                                 else:
                                     # 已過平倉時間
                                     close_countdown = "00:00:00.000"
@@ -2871,16 +2965,20 @@ class FundingRateTrader:
                                     time.sleep(self.check_interval)
                                     continue
                             
-                            # 檢查是否需要備用強制平倉（主要平倉邏輯失敗時的保險措施）
+                            # 檢查是否需要備用強制平倉（第2層：結算後1秒檢查）
                             if time_to_settlement <= 0 and self.current_position and not self.is_closing:
-                                # 只有在主要平倉時機過了很久後才觸發備用強制平倉
-                                if abs(time_to_settlement) >= self.force_close_after_seconds * 1000:  # 轉換為毫秒比較
-                                    print(f"\n[{self.format_corrected_time()}] 備用強制平倉：主要平倉未執行，結算後{abs(time_to_settlement)/1000:.3f}秒強制平倉")
-                                    self.log_trade_step('close', best_opportunity['symbol'], 'backup_force_close_triggered', safe_json_serialize({
+                                # 計算結算後經過的時間
+                                time_since_settlement = abs(time_to_settlement) / 1000  # 轉換為秒
+                                
+                                # 🎯 第2層檢查：結算後1秒，有持倉就執行強制平倉
+                                if time_since_settlement >= self.force_close_after_seconds:
+                                    print(f"\n[{self.format_corrected_time()}] 🚨 第2層強制平倉觸發：結算後{time_since_settlement:.3f}秒，檢查到持倉執行強制平倉")
+                                    self.log_trade_step('close', best_opportunity['symbol'], 'layer2_force_close_triggered', safe_json_serialize({
                                             'time_to_settlement': time_to_settlement,
+                                            'time_since_settlement': time_since_settlement,
                                             'force_close_after_seconds': self.force_close_after_seconds,
                                         'settlement_time': datetime.fromtimestamp(real_settlement_time / 1000).strftime('%H:%M:%S.%f'),
-                                        'reason': '主要平倉邏輯未執行，備用強制平倉'
+                                        'reason': '第2層平倉機制：結算後1秒檢查到持倉'
                                 }))
                                 self.is_closing = True
                                 self.force_close_position()
@@ -2961,6 +3059,21 @@ class FundingRateTrader:
                                     'entry_before_seconds': self.entry_before_seconds,
                                     'settlement_time': datetime.fromtimestamp(real_settlement_time / 1000).strftime('%H:%M:%S.%f')
                                 }))
+                                
+                                # 🔒 進場前併發檢查
+                                if self.is_api_calling:
+                                    print(f"[{self.format_corrected_time()}] 檢測到API調用進行中，延遲進場以避免衝突")
+                                    self.log_trade_step('entry', best_opportunity['symbol'], 'delayed_for_api', {
+                                        'api_call_duration': time.time() - self.api_call_start_time
+                                    })
+                                    time.sleep(0.2)  # 等待API調用完成
+                                    
+                                    # 再次檢查
+                                    if self.is_api_calling:
+                                        print(f"[{self.format_corrected_time()}] API調用仍在進行，取消此次進場")
+                                        self.log_trade_step('entry', best_opportunity['symbol'], 'cancelled_for_api', {})
+                                        time.sleep(self.check_interval)
+                                        continue
                                 
                                 # 開倉
                                 self.open_position(best_opportunity['symbol'], best_opportunity['direction'], best_opportunity['funding_rate'], best_opportunity['next_funding_time'])
@@ -4276,8 +4389,102 @@ class FundingRateTrader:
             return system_info
         except Exception as e:
             print(f"[{self.format_corrected_time()}] 獲取網絡質量信息失敗: {e}")
-            return {}
-
+                        return {}
+    
+    def execute_api_call_with_timeout(self, api_func, *args, max_retries=3, timeout=10, **kwargs):
+        """執行API調用，包含超時處理和重試機制（併發保護版）"""
+        
+        # 🔒 併發保護：檢查是否可以進行API調用
+        with self.api_call_lock:
+            # 檢查是否超過最大併發數
+            if self.concurrent_api_calls >= self.max_concurrent_api_calls:
+                wait_time = 0.1
+                print(f"[{self.format_corrected_time()}] 🔒 API調用排隊中，等待{wait_time}秒...")
+                time.sleep(wait_time)
+                
+                # 再次檢查
+                if self.concurrent_api_calls >= self.max_concurrent_api_calls:
+                    raise Exception(f"API調用忙碌，已達到最大併發數限制: {self.max_concurrent_api_calls}")
+            
+            # 檢查是否有長時間運行的API調用
+            if self.is_api_calling:
+                stuck_duration = time.time() - self.api_call_start_time
+                if stuck_duration > self.max_api_call_duration:
+                    print(f"[{self.format_corrected_time()}] 🚨 檢測到卡住的API調用，已運行{stuck_duration:.1f}秒，重置狀態")
+                    self.is_api_calling = False
+                    self.concurrent_api_calls = 0
+                else:
+                    raise Exception(f"API調用進行中，已運行{stuck_duration:.1f}秒，請稍後重試")
+            
+            # 設置API調用狀態
+            self.is_api_calling = True
+            self.api_call_start_time = time.time()
+            self.concurrent_api_calls += 1
+        
+        try:
+            # 執行重試邏輯
+            for attempt in range(max_retries + 1):
+                try:
+                    start_time = time.time()
+                    
+                    # 執行API調用
+                    result = api_func(*args, **kwargs)
+                    execution_time = int((time.time() - start_time) * 1000)
+                    
+                    # 記錄成功調用
+                    if execution_time > 2000:  # 超過2秒的極慢調用
+                        print(f"[{self.format_corrected_time()}] 🚨 API調用極慢: {api_func.__name__} - {execution_time}ms")
+                    elif execution_time > 1000:  # 超過1秒的慢調用
+                        print(f"[{self.format_corrected_time()}] ⚠️ API調用較慢: {api_func.__name__} - {execution_time}ms")
+                    
+                    return result
+                        
+                except (requests.exceptions.Timeout, requests.exceptions.RequestException, BinanceAPIException) as e:
+                    execution_time = int((time.time() - start_time) * 1000)
+                    
+                    if attempt < max_retries:
+                        backoff_time = (0.5 * (2 ** attempt))  # 指數退避：0.5s, 1s, 2s
+                        print(f"[{self.format_corrected_time()}] ⚠️ API調用超時重試 {attempt+1}/{max_retries}: {api_func.__name__} - {execution_time}ms, 等待{backoff_time:.1f}秒後重試")
+                        
+                        # 🔒 重試期間暫時釋放鎖定，但保持計數
+                        with self.api_call_lock:
+                            self.is_api_calling = False
+                        
+                        time.sleep(backoff_time)
+                        
+                        # 重新獲取鎖定
+                        with self.api_call_lock:
+                            self.is_api_calling = True
+                            self.api_call_start_time = time.time()
+                    else:
+                        print(f"[{self.format_corrected_time()}] ❌ API調用最終失敗: {api_func.__name__} - {execution_time}ms, 錯誤: {e}")
+                        raise e
+                        
+                except Exception as e:
+                    execution_time = int((time.time() - start_time) * 1000)
+                    print(f"[{self.format_corrected_time()}] ❌ API調用異常: {api_func.__name__} - {execution_time}ms, 錯誤: {e}")
+                    raise e
+            
+            raise Exception(f"API調用失敗，已重試{max_retries}次")
+            
+        finally:
+            # 🔒 無論成功失敗都要重置狀態
+            with self.api_call_lock:
+                self.is_api_calling = False
+                self.concurrent_api_calls = max(0, self.concurrent_api_calls - 1)
+                
+                # 如果有其他等待的API調用，記錄狀態
+                if self.concurrent_api_calls > 0:
+                    print(f"[{self.format_corrected_time()}] 📋 API調用完成，仍有{self.concurrent_api_calls}個調用進行中")
+    
+    def safe_api_call(self, api_func, *args, **kwargs):
+        """安全的API調用包裝器"""
+        try:
+            return self.execute_api_call_with_timeout(api_func, *args, **kwargs)
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] API調用失敗: {api_func.__name__} - {e}")
+            return None
+    
     def record_detailed_close_analysis(self, symbol: str, order_data: dict, pre_balance: dict = None):
         """記錄詳細的平倉分析"""
         try:

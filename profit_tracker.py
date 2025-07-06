@@ -383,11 +383,17 @@ class ProfitTracker:
         
         # 時間資訊
         if entry_timestamp and exit_timestamp:
-            entry_time = datetime.fromtimestamp(entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-            exit_time = datetime.fromtimestamp(exit_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
+            # 使用毫秒精度的時間格式，與詳細分析報告保持一致
+            entry_time = datetime.fromtimestamp(entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            exit_time = datetime.fromtimestamp(exit_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            # 計算更精確的持倉時間（毫秒級）
+            duration_ms = exit_timestamp - entry_timestamp
+            duration_seconds = duration_ms / 1000
+            
             message += f"<b>開倉時間:</b> {entry_time}\n"
             message += f"<b>平倉時間:</b> {exit_time}\n"
-            message += f"<b>持倉時間:</b> {position_duration}秒\n"
+            message += f"<b>持倉時間:</b> {duration_seconds:.3f}秒\n"
         
         # 倉位和保證金資訊
         message += f"<b>倉位價值:</b> {position_value:.2f} USDT\n"

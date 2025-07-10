@@ -167,6 +167,14 @@ credentials.json
 
 # 配置文件 - 包含敏感信息，不要上傳
 config.py
+config_local.py
+config_production.py
+
+# 交易數據和歷史記錄
+trade_history.json
+trade_*.json
+*.csv
+*.xlsx
 
 # 日誌文件
 logs/

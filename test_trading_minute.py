@@ -13,7 +13,7 @@ import threading
 import os
 import sys
 import signal
-from config import API_KEY, API_SECRET, MAX_POSITION_SIZE, LEVERAGE, MIN_FUNDING_RATE, MAX_SPREAD, ENTRY_BEFORE_SECONDS, CHECK_INTERVAL, ENTRY_TIME_TOLERANCE, CLOSE_BEFORE_SECONDS, CLOSE_AFTER_SECONDS, CLOSE_DELAY_AFTER_ENTRY, MAX_CLOSE_RETRY, TRADING_HOURS, TRADING_MINUTES, TRADING_SYMBOLS, EXCLUDED_SYMBOLS, MAX_ENTRY_RETRY, ENTRY_RETRY_INTERVAL, ENTRY_RETRY_UNTIL_SETTLEMENT, CLOSE_RETRY_INTERVAL, FORCE_CLOSE_AT_SETTLEMENT, ACCOUNT_CHECK_INTERVAL, POSITION_TIMEOUT_SECONDS, ENABLE_POSITION_CLEANUP, FORCE_CLOSE_AFTER_SECONDS, POSITION_CHECK_INTERVAL
+from config import API_KEY, API_SECRET, MAX_POSITION_SIZE, LEVERAGE, MIN_FUNDING_RATE, MAX_SPREAD, ENTRY_BEFORE_SECONDS, CLOSE_BEFORE_SECONDS, CHECK_INTERVAL, ENTRY_TIME_TOLERANCE, CLOSE_AFTER_SECONDS, TRADING_HOURS, TRADING_MINUTES, TRADING_SYMBOLS, EXCLUDED_SYMBOLS, MAX_ENTRY_RETRY, ENTRY_RETRY_INTERVAL, ENTRY_RETRY_UNTIL_SETTLEMENT, ACCOUNT_CHECK_INTERVAL, POSITION_TIMEOUT_SECONDS, ENABLE_POSITION_CLEANUP, POSITION_CHECK_INTERVAL, BACKUP_CLOSE_CHECK_INTERVAL, BACKUP_CLOSE_TIMEOUT
 import traceback
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -164,30 +164,18 @@ def get_log_stats(log_dir='logs'):
 
 class FundingRateTrader:
     def __init__(self):
-        # 配置API客戶端超時設置
-        self.client = Client(
-            API_KEY, 
-            API_SECRET,
-            requests_params={
-                'timeout': 10,  # 設置10秒超時
-                'verify': True,  # 啟用SSL驗證
-                'pool_connections': 10,  # 連接池大小
-                'pool_maxsize': 10,  # 最大連接數
-                'max_retries': 3,  # 最大重試次數
-                'backoff_factor': 0.3  # 重試間隔因子
-            }
-        )
+        # 配置API客戶端 - 使用基本配置避免參數衝突
+        self.client = Client(API_KEY, API_SECRET)
         self.max_position_size = MAX_POSITION_SIZE
         self.leverage = LEVERAGE
         self.min_funding_rate = MIN_FUNDING_RATE
         self.max_spread = MAX_SPREAD
         self.entry_before_seconds = ENTRY_BEFORE_SECONDS
+        self.close_before_seconds = CLOSE_BEFORE_SECONDS  # 平倉提前時間（已停用）
         self.check_interval = CHECK_INTERVAL  # 主循環檢查間隔
         self.funding_rate_threshold = MIN_FUNDING_RATE
         self.entry_time_tolerance = ENTRY_TIME_TOLERANCE  # 進場時間容差（毫秒）
-        self.close_before_seconds = CLOSE_BEFORE_SECONDS
         self.close_after_seconds = CLOSE_AFTER_SECONDS  # 結算後平倉時間 (主要平倉邏輯)
-        self.close_delay_after_entry = CLOSE_DELAY_AFTER_ENTRY  # 開倉成功後延遲平倉時間
         self.current_position = None
         self.position_open_time = None
         self.funding_rates = {}  # 儲存資金費率數據
@@ -235,12 +223,9 @@ class FundingRateTrader:
         self.entry_retry_start_time = 0  # 進場重試開始時間
         self.entry_retry_settlement_time = 0  # 進場重試的結算時間
         
-        self.max_close_retry = MAX_CLOSE_RETRY  # 最大平倉重試次數
-        self.close_retry_interval = CLOSE_RETRY_INTERVAL  # 平倉重試間隔
-        self.force_close_at_settlement = FORCE_CLOSE_AT_SETTLEMENT  # 結算時強制平倉
-        self.force_close_after_seconds = FORCE_CLOSE_AFTER_SECONDS  # 強制平倉時間（結算後N秒）
-        self.close_retry_count = 0  # 當前平倉重試次數
-        self.close_retry_start_time = 0  # 平倉重試開始時間
+        # 新增：備用平倉設定
+        self.backup_close_check_interval = BACKUP_CLOSE_CHECK_INTERVAL  # 備用檢查間隔
+        self.backup_close_timeout = BACKUP_CLOSE_TIMEOUT  # 備用檢查超時
         
         # 新增：定期檢查帳戶和清理超時倉位
         self.account_check_interval = ACCOUNT_CHECK_INTERVAL  # 帳戶檢查間隔（秒）
@@ -274,18 +259,16 @@ class FundingRateTrader:
         
         # 🎯 確定當前平倉模式 (用於顯示)
         self._close_method_display = self._determine_close_method_display()
+        
+        # 🧹 為向後兼容性保留的廢棄變量（設為0或False）
+        self.close_retry_count = 0  # 已廢棄，但force_close_position中可能需要
+        self.close_retry_start_time = 0  # 已廢棄
+        self.max_close_retry = 0  # 已廢棄
 
     def _determine_close_method_display(self):
-        """確定平倉模式的顯示文字"""
-        # 根據配置判斷平倉方法
-        if hasattr(self, 'max_close_retry') and self.max_close_retry == 0:
-            return "🚨極簡平倉(立即)"
-        elif hasattr(self, 'close_after_seconds') and self.close_after_seconds <= 0.05:
-            return "🚨極簡平倉(立即)"
-        elif hasattr(self, 'close_after_seconds') and self.close_after_seconds <= 0.1:
-            return f"⚡超極速平倉(+{self.close_after_seconds}s)"
-        else:
-            return f"📋完整平倉(+{self.close_after_seconds}s)"
+        """確定平倉模式的顯示文字 - 簡化版"""
+        # 現在所有平倉都使用統一的簡化方法
+        return f"⚡簡化平倉(+{self.close_after_seconds}s)"
 
     def _setup_logger(self):
         """設置日誌 - 使用全域日誌器，避免重複"""
@@ -311,6 +294,14 @@ class FundingRateTrader:
         # !markPrice@arr 會自動推送所有合約的資金費率和標記價格數據
         # 無需額外訂閱操作
         print(f"[{self.format_corrected_time()}] WebSocket 已連接到 !markPrice@arr，自動接收資金費率數據")
+        
+        # 🔧 新增：添加全市場訂單簿數據流
+        # !bookTicker 推送所有交易對的最優買賣價數據
+        print(f"[{self.format_corrected_time()}] WebSocket 已連接到 !bookTicker，自動接收訂單簿數據")
+        
+        # 初始化訂單簿數據存儲
+        if not hasattr(self, 'book_tickers'):
+            self.book_tickers = {}
 
     def on_message(self, ws, message):
         """處理 WebSocket 消息 - 處理資金費率數據"""
@@ -631,7 +622,13 @@ class FundingRateTrader:
         """計算淨收益 = 資金費率 - 點差"""
         spread = self.get_spread(symbol)
         abs_funding_rate = abs(funding_rate)
-        net_profit = abs_funding_rate - spread if spread < 999 else -999
+        
+        # 🔧 修復：點差獲取失敗時使用默認值，而不是直接排除
+        if spread >= 999:  # 點差獲取失敗
+            spread = 0.05  # 使用0.05%作為默認點差
+            print(f"[{self.format_corrected_time()}] ⚠️ {symbol} 點差獲取失敗，使用默認0.05%")
+        
+        net_profit = abs_funding_rate - spread
         return net_profit, spread
 
     def get_best_opportunity(self, min_funding_rate: float = None) -> Optional[Dict]:
@@ -991,207 +988,9 @@ class FundingRateTrader:
                 self.log_trade_step('entry', symbol, 'retry_max_reached', {})
                 self.entry_retry_count = 0
 
-    def close_position_ultra_fast(self):
-        """超級極速平倉 - 最小化操作，保留關鍵記錄，增強分析數據"""
-        if not self.current_position:
-            return
-            
-        symbol = self.current_position['symbol']
-        direction = self.current_position['direction']
-        quantity = self.current_position['quantity']
-        entry_price = self.current_position.get('entry_price', 0.0)
-        funding_rate = self.current_position.get('funding_rate', 0.0)
-        
-        try:
-            # 記錄開始時間和系統狀態
-            close_start_time = time.time()
-            corrected_time_ms = self.get_corrected_time()
-            
-            # 獲取市場狀況快照（不影響速度）
-            try:
-                book_ticker = self.book_tickers.get(symbol, {})
-                bid_price = float(book_ticker.get('bidPrice', 0))
-                ask_price = float(book_ticker.get('askPrice', 0))
-                spread_amount = ask_price - bid_price if bid_price and ask_price else 0
-                spread_percentage = (spread_amount / ask_price * 100) if ask_price > 0 else 0
-                mid_price = (bid_price + ask_price) / 2 if bid_price and ask_price else 0
-                market_liquidity = "優良" if spread_percentage < 0.05 else "正常" if spread_percentage < 0.1 else "較差" if spread_percentage < 0.2 else "很差"
-            except:
-                bid_price = ask_price = spread_amount = spread_percentage = mid_price = 0
-                market_liquidity = "未知"
-            
-            # 詳細記錄開始（包含市場和系統分析）
-            print(f"[{self.format_corrected_time()}] ⚡極速平倉啟動: {symbol} {direction} {quantity} | 點差:{spread_percentage:.4f}% | 流動性:{market_liquidity}")
-            
-            self.write_trade_analysis('ultra_fast_close_detailed_start', symbol,
-                                    close_method='超級極速平倉',
-                                    optimization_level='最高',
-                                    trade_basic_info={
-                                        'direction': direction,
-                                        'quantity': quantity,
-                                        'entry_price': entry_price,
-                                        'funding_rate': funding_rate
-                                    },
-                                    market_snapshot={
-                                        'bid_price': bid_price,
-                                        'ask_price': ask_price,
-                                        'mid_price': mid_price,
-                                        'spread_amount': spread_amount,
-                                        'spread_percentage': f"{spread_percentage:.4f}%",
-                                        'liquidity_rating': market_liquidity
-                                    },
-                                    system_status={
-                                        'corrected_time_ms': corrected_time_ms,
-                                        'local_time_ms': int(close_start_time * 1000),
-                                        'time_offset_ms': self.time_offset,
-                                        'retry_count': self.close_retry_count,
-                                        'is_first_attempt': self.close_retry_count == 0
-                                    },
-                                    skip_features=['價格重新獲取', '倉位檢查', '重試機制', '複雜日誌'])
-            
-            # 直接執行：確定方向 + 發送訂單
-            side = 'SELL' if direction == 'long' else 'BUY'
-            
-            # API調用前的最後檢查
-            api_prepare_start = time.time()
-            order_params = {
-                'symbol': symbol,
-                'side': side,
-                'type': 'MARKET',
-                'quantity': quantity,
-                'reduceOnly': True
-            }
-            api_prepare_time_ms = int((time.time() - api_prepare_start) * 1000)
-            
-            # 核心操作：直接發送平倉訂單 (使用超時處理)
-            order_start_time = time.time()
-            order = self.execute_api_call_with_timeout(
-                self.client.futures_create_order,
-                timeout=8,  # 8秒超時（平倉更急迫）
-                max_retries=1,  # 極速平倉只重試1次
-                **order_params
-            )
-            order_end_time = time.time()
-            
-            # 時間分析
-            execution_time_ms = int((order_end_time - order_start_time) * 1000)
-            total_time_ms = int((order_end_time - close_start_time) * 1000)
-            
-            # 提取訂單詳細信息
-            order_id = order.get('orderId', 'UNKNOWN')
-            executed_qty = order.get('executedQty', quantity)
-            avg_price = float(order.get('avgPrice', 0)) if order.get('avgPrice') else 0
-            order_status = order.get('status', 'UNKNOWN')
-            
-            # 效能評估
-            efficiency_score = "極優" if execution_time_ms < 100 else "優秀" if execution_time_ms < 200 else "良好" if execution_time_ms < 500 else "普通" if execution_time_ms < 1000 else "需改善"
-            speed_vs_market = "超快" if total_time_ms < 150 else "很快" if total_time_ms < 300 else "快速" if total_time_ms < 600 else "正常"
-            
-            # 價格執行分析
-            price_analysis = {}
-            if avg_price > 0:
-                if direction == 'long':
-                    # 多頭平倉，比較與賣價
-                    slippage = ((bid_price - avg_price) / bid_price * 100) if bid_price > 0 else 0
-                    vs_mid = ((avg_price - mid_price) / mid_price * 100) if mid_price > 0 else 0
-                else:
-                    # 空頭平倉，比較與買價
-                    slippage = ((avg_price - ask_price) / ask_price * 100) if ask_price > 0 else 0
-                    vs_mid = ((mid_price - avg_price) / mid_price * 100) if mid_price > 0 else 0
-                
-                price_analysis = {
-                    'slippage_percentage': f"{slippage:.4f}%",
-                    'vs_mid_price': f"{vs_mid:.4f}%",
-                    'execution_quality': "優秀" if abs(slippage) < 0.01 else "良好" if abs(slippage) < 0.05 else "普通"
-                }
-            
-            # 關鍵記錄：成功信息
-            print(f"[{self.format_corrected_time()}] ✅極速平倉成功: {symbol} ID:{order_id} | API:{execution_time_ms}ms | 總計:{total_time_ms}ms | 效率:{efficiency_score} | 成交:{avg_price}")
-            
-            # 記錄到分析文件（詳細的效能和市場分析）
-            self.write_trade_analysis('ultra_fast_close_detailed_success', symbol, 
-                                    order_id=order_id,
-                                    close_method='超級極速平倉',
-                                    execution_result={
-                                        'order_status': order_status,
-                                        'executed_qty': executed_qty,
-                                        'avg_price': avg_price,
-                                        'side_executed': order.get('side', side)
-                                    },
-                                    performance_metrics={
-                                        'api_response_time_ms': execution_time_ms,
-                                        'total_process_time_ms': total_time_ms,
-                                        'api_prepare_time_ms': api_prepare_time_ms,
-                                        'efficiency_score': efficiency_score,
-                                        'speed_rating': speed_vs_market
-                                    },
-                                    price_execution_analysis=price_analysis,
-                                    market_condition_impact={
-                                        'market_liquidity': market_liquidity,
-                                        'spread_at_execution': f"{spread_percentage:.4f}%",
-                                        'optimal_execution_window': "是" if spread_percentage < 0.1 else "否"
-                                    },
-                                    trading_context={
-                                        'direction': direction,
-                                        'quantity': quantity,
-                                        'entry_price': entry_price,
-                                        'funding_rate': funding_rate,
-                                        'retry_attempt': self.close_retry_count
-                                    })
-            
-            # 📝 記錄超詳細平倉分析
-            self.record_detailed_close_analysis(symbol, order)
-            
-            # 立即清理狀態
-            self.current_position = None
-            self.position_open_time = None
-            self.close_retry_count = 0
-            self.is_closing = False
-            
-            # 延後處理：盈虧計算、收益追蹤、通知等（不影響速度）
-            self.schedule_post_close_processing(symbol, direction, quantity, order)
-            
-            return True
-            
-        except Exception as e:
-            error_time = time.time()
-            total_error_time_ms = int((error_time - close_start_time) * 1000)
-            
-            print(f"[{self.format_corrected_time()}] ❌極速平倉失敗: {symbol} - {e} | 耗時:{total_error_time_ms}ms")
-            
-            # 詳細記錄失敗信息（包含錯誤分析）
-            self.write_trade_analysis('ultra_fast_close_detailed_failed', symbol, 
-                                    error=str(e),
-                                    error_type=type(e).__name__,
-                                    close_method='超級極速平倉',
-                                    failure_analysis={
-                                        'total_time_before_error_ms': total_error_time_ms,
-                                        'failure_stage': 'API調用' if 'order' in str(e).lower() else 'market_data' if 'ticker' in str(e).lower() else '未知',
-                                        'error_severity': 'critical' if 'connection' in str(e).lower() else 'moderate',
-                                        'retry_recommended': True
-                                    },
-                                    context_at_failure={
-                                        'direction': direction,
-                                        'quantity': quantity,
-                                        'entry_price': entry_price,
-                                        'funding_rate': funding_rate,
-                                        'retry_count': self.close_retry_count,
-                                        'market_liquidity': market_liquidity if 'market_liquidity' in locals() else 'unknown'
-                                    },
-                                    fallback_action='切換到完整平倉重試機制',
-                                    next_method='close_position_with_retry')
-            
-            # 失敗時回退到重試機制
-            return self.close_position_with_retry()
 
-    def close_position_fast(self):
-        """極速平倉 - 只保留核心操作"""
-        if not self.current_position:
-            return
-            
-        symbol = self.current_position['symbol']
-        direction = self.current_position['direction']
-        quantity = self.current_position['quantity']
+
+
         
         try:
             # 記錄極速平倉開始
@@ -1559,50 +1358,31 @@ class FundingRateTrader:
         # 在1秒後執行延後處理，避免影響後續交易
         print(f"[{self.format_corrected_time()}] 延後處理已安排，將在1秒後執行: {symbol}")
         threading.Timer(1.0, post_process).start()
+            
+
     
-    def close_position_with_retry(self):
-        """帶重試機制的完整平倉"""
-        # 這裡使用原來的完整平倉邏輯
-        return self.close_position_original()
-    
-    def close_position_minimal(self):
-        """極簡平倉 - 不重試，一次搞定，適合高頻檢查策略"""
+
+            
+
+
+
+
+
+
+    def close_position(self):
+        """簡化平倉 - 直接發送市價單"""
         if not self.current_position:
             return False
             
         symbol = self.current_position['symbol']
-        direction = self.current_position['direction']
+        direction = self.current_position['direction'] 
         quantity = self.current_position['quantity']
-        entry_price = self.current_position.get('entry_price', 0.0)
-        funding_rate = self.current_position.get('funding_rate', 0.0)
-        
-        # 📝 記錄極簡平倉開始
-        self.write_trade_analysis('minimal_close_start', symbol,
-                                close_method='極簡平倉',
-                                direction=direction,
-                                quantity=quantity,
-                                entry_price=entry_price,
-                                funding_rate=funding_rate,
-                                strategy='不重試，一次成功或失敗',
-                                optimization_level='最高速度')
-        
-        self.record_close_step('close_start', symbol=symbol, direction=direction, quantity=quantity)
         
         try:
-            print(f"[{self.format_corrected_time()}] 🎯極簡平倉: {symbol} {direction} {quantity}")
-            
-            # 直接發送平倉訂單，不做任何檢查
+            # 簡化平倉：直接發送市價單
             side = 'SELL' if direction == 'long' else 'BUY'
-            
-            # 📝 記錄訂單準備
-            self.write_trade_analysis('minimal_close_prepare', symbol,
-                                    action='準備發送訂單',
-                                    side=side,
-                                    order_type='MARKET',
-                                    reduce_only=True,
-                                    no_checks='跳過所有驗證以提高速度')
-            
             start_time = time.time()
+            
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -1610,72 +1390,12 @@ class FundingRateTrader:
                 quantity=quantity,
                 reduceOnly=True
             )
-            execution_time = int((time.time() - start_time) * 1000)
             
-            # 📝 記錄訂單成功
-            order_id = order.get('orderId', 'N/A')
-            executed_qty = order.get('executedQty', '0')
-            avg_price = order.get('avgPrice', '0.0')
+            execution_time_ms = int((time.time() - start_time) * 1000)
             
-            self.write_trade_analysis('minimal_close_order_success', symbol,
-                                    order_id=order_id,
-                                    execution_time_ms=execution_time,
-                                    executed_qty=executed_qty,
-                                    avg_price=avg_price,
-                                    api_response_time=f'{execution_time}ms',
-                                    order_status='已發送')
+            print(f"[{self.format_corrected_time()}] ✅平倉成功: {symbol} | {execution_time_ms}ms | ID:{order['orderId']}")
             
-            print(f"[{self.format_corrected_time()}] ✅極簡平倉成功: {symbol} ID:{order_id} | {execution_time}ms")
-            
-            # 📝 計算並記錄交易總結
-            exit_price = float(avg_price) if avg_price and avg_price != '0.0' else entry_price
-            pnl = 0.0
-            if entry_price > 0 and exit_price > 0:
-                if direction == 'long':
-                    pnl = (exit_price - entry_price) * float(quantity)
-                else:
-                    pnl = (entry_price - exit_price) * float(quantity)
-            
-            position_duration = int(time.time() - self.position_open_time) if self.position_open_time else 0
-            
-            # 📝 記錄極簡平倉完成
-            self.write_trade_analysis('minimal_close_complete', symbol,
-                                    direction=direction,
-                                    quantity=quantity,
-                                    entry_price=entry_price,
-                                    exit_price=exit_price,
-                                    pnl=pnl,
-                                    funding_rate=funding_rate,
-                                    position_duration_seconds=position_duration,
-                                    execution_time_ms=execution_time,
-                                    order_id=order_id,
-                                    close_method='極簡平倉',
-                                    retry_count=0,
-                                    total_checks=0,
-                                    processing_type='即時清理')
-            
-            # 📝 記錄超詳細平倉分析
-            self.record_detailed_close_analysis(symbol, order)
-            
-            self.record_close_step('close_success', symbol=symbol, 
-                                 order_id=order_id, 
-                                 executed_qty=executed_qty, 
-                                 avg_price=avg_price,
-                                 execution_time_ms=execution_time)
-            
-            # 📝 記錄到交易事件日誌
-            self.log_trade_event('close_success', symbol, {
-                'direction': direction,
-                'quantity': quantity,
-                'entry_price': entry_price,
-                'exit_price': exit_price,
-                'pnl': pnl,
-                'order_id': order_id,
-                'execution_time_ms': execution_time,
-                'close_method': 'minimal'
-            })
-            
-            # 立即清理，不做延後處理
+            # 清理狀態
             self.current_position = None
             self.position_open_time = None
             self.is_closing = False
@@ -1683,480 +1403,13 @@ class FundingRateTrader:
             return True
             
         except Exception as e:
-            # 📝 記錄極簡平倉失敗
-            self.write_trade_analysis('minimal_close_failed', symbol,
-                                    error=str(e),
-                                    direction=direction,
-                                    quantity=quantity,
-                                    close_method='極簡平倉',
-                                    retry_attempt=False,
-                                    cleanup_action='直接清理倉位記錄')
-            
-            self.record_close_step('close_failed', symbol=symbol, error=str(e))
-            
-            # 📝 記錄到交易事件日誌
-            self.log_trade_event('close_failed', symbol, {
-                'error': str(e),
-                'direction': direction,
-                'quantity': quantity,
-                'close_method': 'minimal'
-            })
-            
-            print(f"[{self.format_corrected_time()}] ❌極簡平倉失敗: {symbol} - {e}")
-            
-            # 失敗就失敗，不重試，直接清理
-            self.current_position = None
-            self.position_open_time = None
-            self.is_closing = False
-            
+            error_time_ms = int((time.time() - start_time) * 1000)
+            print(f"[{self.format_corrected_time()}] ❌平倉失敗: {symbol} - {e} | {error_time_ms}ms")
             return False
     
-    def close_position(self):
-        """平倉 - 根據配置選擇最佳平倉方式"""
-        symbol = self.current_position['symbol'] if self.current_position else 'UNKNOWN'
-        
-        # 如果重試次數設為0，使用極簡平倉
-        if hasattr(self, 'max_close_retry') and self.max_close_retry == 0:
-            return self.close_position_minimal()
-        # 如果CLOSE_AFTER_SECONDS <= 0.05，使用極簡平倉
-        elif hasattr(self, 'close_after_seconds') and self.close_after_seconds <= 0.05:
-            return self.close_position_minimal()
-        # 如果CLOSE_AFTER_SECONDS <= 0.1，使用超級極速版本（結算後快速平倉）
-        elif hasattr(self, 'close_after_seconds') and self.close_after_seconds <= 0.1:
-            return self.close_position_ultra_fast()
-        else:
-            # 使用完整平倉模式
-            return self.close_position_original()
-    
-    def close_position_original(self):
-        """完整平倉 - 包含所有檢查和日誌"""
-        if not self.current_position:
-            return
-            
-        symbol = self.current_position['symbol']
-        direction = self.current_position['direction']
-        quantity = self.current_position['quantity']
-        
-        # 記錄完整平倉開始
-        self.write_trade_analysis('complete_close_start', symbol,
-                                close_method='完整平倉',
-                                direction=direction,
-                                quantity=quantity,
-                                retry_count=self.close_retry_count,
-                                trigger_reason='時間觸發或手動',
-                                includes_features=['倉位檢查', '價格獲取', '重試機制', '詳細日誌'])
-        
-        try:
-            # 步驟1: 決定是否檢查實際倉位
-            step_num = 1
-            if self.close_retry_count > 0:
-                # 重試情況 - 需要檢查實際倉位
-                self.write_trade_analysis('complete_close_step_retry_check', symbol,
-                                        step_number=step_num,
-                                        action='重試模式 - 檢查實際倉位',
-                                        retry_count=self.close_retry_count,
-                                        reason='重試平倉需要確認實際倉位狀況')
-                
-                print(f"[{self.format_corrected_time()}] 重試平倉，檢查實際倉位狀況...")
-                self.log_trade_step('close', symbol, 'retry_position_check', {'retry_count': self.close_retry_count})
-                
-                step_num += 1
-                # 步驟2: API 調用檢查倉位
-                self.write_trade_analysis('complete_close_step_api_position_check', symbol,
-                                        step_number=step_num,
-                                        action='API調用 - 檢查倉位',
-                                        api_method='check_actual_position')
-                
-                actual_position = self.check_actual_position(symbol)
-                
-                step_num += 1
-                if not actual_position:
-                    # 步驟3a: 無倉位情況
-                    self.write_trade_analysis('complete_close_step_no_position', symbol,
-                                            step_number=step_num,
-                                            action='倉位檢查結果 - 無倉位',
-                                            result='已無持倉，結束平倉流程',
-                                            cleanup_actions=['清空current_position', '重置retry_count', '重置is_closing'])
-                    
-                    print(f"[{self.format_corrected_time()}] 倉位檢查: {symbol} 已無持倉，無需平倉")
-                    self.log_trade_step('close', symbol, 'position_not_found', {})
-                    # 清空持倉記錄
-                    self.current_position = None
-                    self.position_open_time = None
-                    self.close_retry_count = 0
-                    self.is_closing = False
-                    return
-                
-                # 步驟3b: 檢查倉位一致性
-                self.write_trade_analysis('complete_close_step_position_validation', symbol,
-                                        step_number=step_num,
-                                        action='倉位一致性檢查',
-                                        expected_direction=direction,
-                                        actual_direction=actual_position['direction'],
-                                        expected_quantity=quantity,
-                                        actual_quantity=actual_position['quantity'])
-                
-                # 檢查倉位方向是否一致
-                if actual_position['direction'] != direction:
-                    step_num += 1
-                    self.write_trade_analysis('complete_close_step_direction_fix', symbol,
-                                            step_number=step_num,
-                                            action='修正倉位方向',
-                                            expected=direction,
-                                            actual=actual_position['direction'],
-                                            action_taken='更新本地記錄')
-                    
-                    print(f"[{self.format_corrected_time()}] 倉位檢查: {symbol} 方向不一致，預期:{direction}，實際:{actual_position['direction']}")
-                    self.log_trade_step('close', symbol, 'direction_mismatch', safe_json_serialize({
-                        'expected': direction,
-                        'actual': actual_position['direction']
-                    }))
-                    # 更新持倉記錄
-                    self.current_position['direction'] = actual_position['direction']
-                    direction = actual_position['direction']
-                
-                # 檢查倉位數量是否一致
-                if abs(actual_position['quantity'] - quantity) > 0.001:  # 允許小數點誤差
-                    step_num += 1
-                    self.write_trade_analysis('complete_close_step_quantity_fix', symbol,
-                                            step_number=step_num,
-                                            action='修正倉位數量',
-                                            expected=quantity,
-                                            actual=actual_position['quantity'],
-                                            difference=abs(actual_position['quantity'] - quantity),
-                                            action_taken='更新本地記錄')
-                    
-                    print(f"[{self.format_corrected_time()}] 倉位檢查: {symbol} 數量不一致，預期:{quantity}，實際:{actual_position['quantity']}")
-                    self.log_trade_step('close', symbol, 'quantity_mismatch', safe_json_serialize({
-                        'expected': quantity,
-                        'actual': actual_position['quantity']
-                    }))
-                    # 更新持倉記錄
-                    self.current_position['quantity'] = actual_position['quantity']
-                    quantity = actual_position['quantity']
-            else:
-                # 首次平倉情況
-                self.write_trade_analysis('complete_close_step_first_attempt', symbol,
-                                        step_number=step_num,
-                                        action='首次平倉 - 使用開倉記錄',
-                                        direction=direction,
-                                        quantity=quantity,
-                                        reason='首次平倉信任開倉記錄，跳過倉位檢查')
-                
-                # 第一次平倉，直接使用開倉記錄
-                print(f"[{self.format_corrected_time()}] 第一次平倉，使用開倉記錄: {symbol} {direction} {quantity}")
-                self.log_trade_step('close', symbol, 'first_close', safe_json_serialize({
-                    'direction': direction,
-                    'quantity': quantity
-                }))
-            
-            # 記錄平倉開始
-            step_num += 1
-            self.write_trade_analysis('complete_close_step_start_process', symbol,
-                                    step_number=step_num,
-                                    action='開始平倉流程',
-                                    validated_direction=direction,
-                                    validated_quantity=quantity)
-            
-            self.record_close_step('close_start', symbol=symbol, direction=direction, quantity=quantity)
-            
-            # 步驟N: 獲取當前價格
-            step_num += 1
-            self.write_trade_analysis('complete_close_step_fetch_price_start', symbol,
-                                    step_number=step_num,
-                                    action='開始獲取當前價格',
-                                    api_method='futures_symbol_ticker',
-                                    reason='完整平倉需要準確價格用於記錄和計算')
-            
-            print(f"[{self.format_corrected_time()}] 獲取平倉價格: {symbol}")
-            self.log_trade_step('close', symbol, 'fetch_close_price_start', {})
-            
-            price_start_time = time.time()
-            ticker = self.client.futures_symbol_ticker(symbol=symbol)
-            price_end_time = time.time()
-            price_fetch_time_ms = int((price_end_time - price_start_time) * 1000)
-            current_price = float(ticker['price'])
-            
-            step_num += 1
-            self.write_trade_analysis('complete_close_step_fetch_price_success', symbol,
-                                    step_number=step_num,
-                                    action='價格獲取成功',
-                                    current_price=current_price,
-                                    fetch_time_ms=price_fetch_time_ms,
-                                    ticker_response=safe_json_serialize(ticker))
-            
-            print(f"[{self.format_corrected_time()}] 平倉價格: {symbol} = {current_price}")
-            self.log_trade_step('close', symbol, 'fetch_close_price_success', safe_json_serialize({'price': current_price}))
-            
-            # 記錄價格獲取時間
-            self.record_close_step('close_price_fetched', symbol=symbol, price=current_price)
-            
-            # 步驟N+1: 確定平倉方向
-            step_num += 1
-            side = 'SELL' if direction == 'long' else 'BUY'
-            self.write_trade_analysis('complete_close_step_determine_side', symbol,
-                                    step_number=step_num,
-                                    action='確定平倉方向',
-                                    position_direction=direction,
-                                    close_side=side,
-                                    logic=f'持倉方向 {direction} -> 平倉方向 {side}')
-            
-            # 步驟N+2: 準備訂單參數
-            step_num += 1
-            order_params = {
-                'symbol': symbol,
-                'side': side,
-                'type': 'MARKET',
-                'quantity': quantity,
-                'reduceOnly': True
-            }
-            self.write_trade_analysis('complete_close_step_prepare_order', symbol,
-                                    step_number=step_num,
-                                    action='準備平倉訂單參數',
-                                    order_params=order_params,
-                                    current_price=current_price)
-            
-            print(f"[{self.format_corrected_time()}] 準備發送平倉訂單: {symbol} {side} {quantity}")
-            self.log_trade_step('close', symbol, 'prepare_close_order', safe_json_serialize({
-                'side': side, 
-                'quantity': quantity, 
-                'type': 'MARKET'
-            }))
-            
-            # 步驟N+3: 發送平倉訂單
-            step_num += 1
-            self.write_trade_analysis('complete_close_step_send_order_start', symbol,
-                                    step_number=step_num,
-                                    action='開始發送平倉訂單',
-                                    api_method='futures_create_order',
-                                    order_params=order_params)
-            
-            print(f"[{self.format_corrected_time()}] 發送平倉訂單: {symbol} {side} {quantity}")
-            self.log_trade_step('close', symbol, 'send_close_order_start', safe_json_serialize({
-                'side': side, 
-                'quantity': quantity, 
-                'type': 'MARKET'
-            }))
-            
-            order_start_time = time.time()
-            # 使用超時處理的API調用
-            order = self.execute_api_call_with_timeout(
-                self.client.futures_create_order,
-                timeout=12,  # 完整平倉允許更長超時
-                max_retries=3,  # 完整平倉重試3次
-                **order_params
-            )
-            order_end_time = time.time()
-            execution_time_ms = int((order_end_time - order_start_time) * 1000)
-            
-            step_num += 1
-            self.write_trade_analysis('complete_close_step_order_response', symbol,
-                                    step_number=step_num,
-                                    action='平倉訂單回傳成功',
-                                    execution_time_ms=execution_time_ms,
-                                    order_response=safe_json_serialize(order),
-                                    order_id=order['orderId'],
-                                    executed_qty=order.get('executedQty', 'N/A'),
-                                    avg_price=order.get('avgPrice', 'N/A'))
-            
-            print(f"[{self.format_corrected_time()}] 平倉訂單發送完成: {symbol} 訂單ID:{order['orderId']} 執行時間:{execution_time_ms}ms")
-            self.log_trade_step('close', symbol, 'send_close_order_success', safe_json_serialize({
-                'order_id': order['orderId'],
-                'execution_time_ms': execution_time_ms,
-                'executed_qty': order['executedQty'],
-                'avg_price': order['avgPrice']
-            }))
-            
-            # 記錄訂單發送時間
-            self.record_close_step('close_order_sent', symbol=symbol, 
-                                 order_id=order['orderId'],
-                                 order_time_ms=execution_time_ms)
-            
-            # 記錄平倉成功
-            self.record_close_step('close_success', symbol=symbol, 
-                                 order_id=order['orderId'],
-                                 executed_qty=order['executedQty'],
-                                 avg_price=order['avgPrice'])
-            
-            # 計算盈虧
-            entry_price = self.current_position['entry_price']
-            pnl = (current_price - entry_price) * quantity if direction == 'long' else (entry_price - current_price) * quantity
-            print(f"[{self.format_corrected_time()}] 計算盈虧: 開倉價:{entry_price} 平倉價:{current_price} 盈虧:{pnl:.2f} USDT")
-            self.log_trade_step('close', symbol, 'pnl_calculation', safe_json_serialize({
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'pnl': pnl,
-                'direction': direction,
-                'quantity': quantity
-            }))
-            
-            # 注意：交易事件將在延後處理中記錄，避免重複
-            
-            # 添加收益追蹤
-            trade_data = {
-                'symbol': symbol,
-                'direction': direction,
-                'quantity': quantity,
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'pnl': pnl,
-                'funding_rate': self.current_position.get('funding_rate', 0.0),
-                'execution_time_ms': execution_time_ms,
-                'position_duration_seconds': int(time.time() - self.position_open_time),
-                'retry_count': self.close_retry_count,
-                'order_id': order['orderId'],
-                # 添加精確的時間戳
-                'entry_timestamp': int(self.position_open_time * 1000),  # 進倉時間戳
-                'exit_timestamp': int(time.time() * 1000)  # 平倉時間戳
-            }
-            self.profit_tracker.add_trade(trade_data)
-            
-            # 📝 記錄超詳細平倉分析
-            self.record_detailed_close_analysis(symbol, order)
 
-            # 平倉後自動推送單筆帳戶分析到TG（延遲1分鐘）
-            def send_trade_account_analysis(trade_data):
-                from account_analyzer import AccountAnalyzer
-                from config import LEVERAGE
-                analyzer = AccountAnalyzer()
-                period = [{
-                    'symbol': trade_data['symbol'],
-                    'entry_time': trade_data['entry_timestamp'],
-                    'exit_time': trade_data['exit_timestamp'],
-                    'direction': trade_data['direction'],
-                    'quantity': trade_data['quantity']
-                }]
-                result = analyzer.analyze_trades_by_time_range(period)
-                if result and result['trades_by_period']:
-                    detail = result['trades_by_period'][0]
-                    
-                    # 計算倉位和保證金資訊
-                    position_value = trade_data['quantity'] * trade_data['entry_price']
-                    margin_used = position_value / LEVERAGE
-                    
-                    # 計算報酬率（淨利 / 保證金）
-                    return_rate = (detail['net_profit'] / margin_used * 100) if margin_used > 0 else 0
-                    
-                    # 分析資金費詳細數據
-                    funding_details = ""
-                    funding_records = [inc for inc in detail.get('income_records', []) if inc['incomeType'] == 'FUNDING_FEE']
-                    if funding_records:
-                        funding_count = len(funding_records)
-                        positive_funding = sum(float(inc['income']) for inc in funding_records if float(inc['income']) > 0)
-                        negative_funding = sum(float(inc['income']) for inc in funding_records if float(inc['income']) < 0)
-                        
-                        # 計算資金費率（資金費 ÷ 持倉價值）
-                        total_funding_fee = detail['funding_fee']
-                        funding_rate_percentage = (total_funding_fee / position_value * 100) if position_value > 0 else 0
-                        
-                        funding_details = f"\n💰 <b>資金費詳細</b>\n"
-                        funding_details += f"資金費次數: {funding_count}\n"
-                        if positive_funding > 0:
-                            funding_details += f"  ↗️ 收入: +{positive_funding:.4f} USDT\n"
-                        if negative_funding < 0:
-                            funding_details += f"  ↘️ 支出: {negative_funding:.4f} USDT\n"
-                        funding_details += f"資金費總計: {detail['funding_fee']:.4f} USDT\n"
-                        funding_details += f"資金費率: {funding_rate_percentage:.4f}% (資金費/持倉價值)"
-                    else:
-                        funding_details = f"\n💰 <b>資金費詳細</b>\n資金費: {detail['funding_fee']:.4f} USDT (無記錄)\n資金費率: 0.0000%"
-                    
-                    # 計算完整的收益分解
-                    program_pnl = trade_data['pnl']
-                    actual_pnl = detail['realized_pnl'] 
-                    commission = detail['commission']
-                    funding_fee = detail['funding_fee']
-                    net_profit = detail['net_profit']
-                    
-                    # 計算理論淨利 = 程式盈虧 + 資金費 - 手續費
-                    theoretical_net = program_pnl + funding_fee - commission
-                    
-                    msg = (
-                        f"📊 <b>單筆真實收益分析</b>\n\n"
-                        f"<b>交易對:</b> {detail['symbol']}\n"
-                        f"<b>方向:</b> {detail['direction'].upper()}\n"
-                        f"<b>數量:</b> {trade_data['quantity']:,}\n"
-                        f"<b>倉位價值:</b> {position_value:.2f} USDT\n"
-                        f"<b>保證金:</b> {margin_used:.2f} USDT\n"
-                        f"<b>槓桿:</b> {LEVERAGE}x\n\n"
-                        f"⏰ <b>時間資訊</b>\n"
-                        f"<b>開倉時間:</b> {datetime.fromtimestamp(detail['entry_time']/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
-                        f"<b>平倉時間:</b> {datetime.fromtimestamp(detail['exit_time']/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
-                        f"<b>持倉時間:</b> {trade_data['position_duration_seconds']}秒\n"
-                        f"{funding_details}\n\n"
-                        f"📈 <b>收益分析</b>\n"
-                        f"<b>程式盈虧:</b> {program_pnl:.4f} USDT (理論價差收益)\n"
-                        f"<b>帳戶實際盈虧:</b> {actual_pnl:.4f} USDT\n"
-                        f"<b>資金費收入:</b> +{funding_fee:.4f} USDT\n"
-                        f"<b>手續費成本:</b> -{commission:.4f} USDT\n"
-                        f"<b>理論淨利:</b> {theoretical_net:.4f} USDT (程式盈虧+資金費-手續費)\n"
-                        f"<b>帳戶淨利:</b> {net_profit:.4f} USDT\n"
-                        f"<b>報酬率:</b> {return_rate:.2f}% (淨利/保證金)\n\n"
-                        f"<b>差異分析:</b> {net_profit - theoretical_net:.4f} USDT (帳戶-理論)\n"
-                        f"<b>程式vs帳戶:</b> {net_profit - program_pnl:.4f} USDT"
-                    )
-                    from profit_tracker import ProfitTracker
-                    ProfitTracker().send_telegram_message(msg)
-            threading.Timer(60, send_trade_account_analysis, args=(trade_data,)).start()
-            
-            print(f"[{self.format_corrected_time()}] 平倉成功] {symbol} {direction} 數量:{quantity} 價格:{current_price} 盈虧:{pnl:.2f} USDT (重試次數:{self.close_retry_count})")
-            self.log_trade_step('close', symbol, 'close_complete', safe_json_serialize({
-                'direction': direction,
-                'quantity': quantity,
-                'price': current_price,
-                'pnl': pnl,
-                'order_id': order['orderId'],
-                'retry_count': self.close_retry_count
-            }))
-            
-            # 顯示詳細時間記錄
-            self.print_detailed_timestamps(symbol)
-            
-            # 清空持倉記錄
-            self.current_position = None
-            self.position_open_time = None
-            
-            # 重置鎖定時間，但保持結算時間記錄
-            self.entry_locked_until = time.time() + 1.0  # 鎖定1秒，防止立即重複進場
-            # 注意：詳細的平倉記錄將在延後處理中完成，避免重複記錄
-            
-            # 重置平倉重試計數器
-            self.close_retry_count = 0
-            self.close_retry_start_time = 0
-            self.is_closing = False
-            
-        except Exception as e:
-            # 記錄平倉失敗
-            self.record_close_step('close_failed', symbol=symbol, error=str(e))
-            self.log_trade_event('close_failed', symbol, {'error': str(e)})
-            self.log_trade_step('close', symbol, 'close_failed', {'error': str(e)})
-            print(f"[{self.format_corrected_time()}] 平倉失敗] {symbol} {direction} 原因: {e}")
-            
-            # 初始化重試機制
-            if self.close_retry_count == 0:
-                self.close_retry_start_time = time.time()
-                print(f"[{self.format_corrected_time()}] 開始平倉重試機制")
-                self.log_trade_step('close', symbol, 'retry_start', {})
-            
-            self.close_retry_count += 1
-            print(f"[{self.format_corrected_time()}] 平倉重試 {self.close_retry_count}/{self.max_close_retry}")
-            self.log_trade_step('close', symbol, 'retry_attempt', safe_json_serialize({
-                'retry_count': self.close_retry_count,
-                'max_retry': self.max_close_retry
-            }))
-            
-            # 如果重試次數未達上限，則繼續重試
-            if self.close_retry_count < self.max_close_retry:
-                print(f"[{self.format_corrected_time()}] 等待 {self.close_retry_interval} 秒後重試平倉...")
-                self.log_trade_step('close', symbol, 'retry_wait', safe_json_serialize({
-                    'wait_seconds': self.close_retry_interval
-                }))
-                time.sleep(self.close_retry_interval)
-                # 重新嘗試平倉
-                self.close_position()
-            else:
-                print(f"[{self.format_corrected_time()}] 平倉重試次數已達上限，嘗試強制平倉")
-                self.log_trade_step('close', symbol, 'retry_max_reached', {})
-                self.force_close_position()
+
+
 
     def check_actual_position(self, symbol: str) -> dict:
         """檢查實際倉位狀況"""
@@ -2716,14 +1969,13 @@ class FundingRateTrader:
         print(f"交易時間: {TRADING_HOURS}")
         print(f"交易幣種: {TRADING_SYMBOLS if TRADING_SYMBOLS else '全部'}")
         print(f"排除幣種: {EXCLUDED_SYMBOLS}")
-        print("--- 重試機制配置 ---")
+        print("--- 簡化平倉機制配置 (v2.0) ---")
         print(f"進場重試次數: {MAX_ENTRY_RETRY}")
         print(f"進場重試間隔: {ENTRY_RETRY_INTERVAL} 秒")
         print(f"結算前持續重試進場: {ENTRY_RETRY_UNTIL_SETTLEMENT}")
-        print(f"平倉重試次數: {MAX_CLOSE_RETRY}")
-        print(f"平倉重試間隔: {CLOSE_RETRY_INTERVAL} 秒")
-        print(f"結算時強制平倉: {FORCE_CLOSE_AT_SETTLEMENT}")
-        print(f"強制平倉時間: 結算後 {FORCE_CLOSE_AFTER_SECONDS} 秒")
+        print(f"✅ 主平倉：結算後 {CLOSE_AFTER_SECONDS} 秒 (直接發送市價單)")
+        print(f"✅ 備用平倉：結算後每 {BACKUP_CLOSE_CHECK_INTERVAL} 秒檢查 (共 {BACKUP_CLOSE_TIMEOUT} 秒)")
+        print("🚫 已移除：平倉重試機制、強制平倉機制、複雜平倉方法")
         print("--- 平倉模式配置 ---")
         print(f"🎯 當前平倉模式: {self._close_method_display}")
         print(f"平倉等待時間: 結算後 {CLOSE_AFTER_SECONDS} 秒")
@@ -2805,75 +2057,42 @@ class FundingRateTrader:
                         print(f"[DEBUG] 主循環狀態: 持倉={self.current_position is not None}, 平倉中={self.is_closing}, API狀態={api_status}, 資金費率數量={len(self.funding_rates)}")
                         self._last_debug_time = time.time()
                     
-                    # 🎯 **優先檢查當前持倉的平倉時機** - 獨立於最佳機會
+                    # 🎯 **簡化平倉檢查：兩種模式**
                     if self.current_position and not self.is_closing:
                         # 獲取當前持倉的結算時間
                         current_position_settlement_time = self.current_position.get('next_funding_time', 0)
                         if current_position_settlement_time > 0:
                             # 計算當前時間
                             current_time_ms = self.get_corrected_time()
+                            symbol = self.current_position['symbol']
                             
-                            # 計算平倉時間（結算後 CLOSE_AFTER_SECONDS 秒）
+                            # **模式1：主平倉** - 結算後延遲X秒平倉
                             close_time_ms = current_position_settlement_time + self.close_after_seconds * 1000
                             time_to_close = close_time_ms - current_time_ms
                             
-                            # 檢查是否到達平倉時間
                             if time_to_close <= 0:
-                                symbol = self.current_position['symbol']
-                                print(f"\n[{self.format_corrected_time()}] 🎯 持倉平倉時間到（結算後{self.close_after_seconds}秒），開始平倉 - 使用: {self._close_method_display}")
-                                self.log_trade_step('close', symbol, 'independent_time_triggered', safe_json_serialize({
-                                    'time_to_close': time_to_close,
-                                    'close_after_seconds': self.close_after_seconds,
-                                    'settlement_time': datetime.fromtimestamp(current_position_settlement_time / 1000).strftime('%H:%M:%S.%f'),
-                                    'trigger_source': 'independent_position_check'
-                                }))
-                                
-                                # 🔒 平倉前併發檢查
-                                if self.is_api_calling:
-                                    print(f"[{self.format_corrected_time()}] 檢測到API調用進行中，但平倉是優先操作，等待完成")
-                                    self.log_trade_step('close', symbol, 'wait_for_api_completion', {
-                                        'api_call_duration': time.time() - self.api_call_start_time
-                                    })
-                                    # 平倉是緊急操作，短暫等待後繼續
-                                    time.sleep(0.1)
-                                
+                                print(f"\n[{self.format_corrected_time()}] ✅ 主平倉時間到（結算後{self.close_after_seconds}秒）")
                                 self.is_closing = True
                                 self.close_position()
-                                time.sleep(self.check_interval)
+                                time.sleep(1)
                                 continue
                             
-                            # 檢查是否需要備用強制平倉（第2層：結算後1秒檢查）
+                            # **模式2：後備平倉** - 結算後一分鐘內每秒檢查
                             time_to_settlement = current_position_settlement_time - current_time_ms
                             if time_to_settlement <= 0:
-                                # 計算結算後經過的時間
                                 time_since_settlement = abs(time_to_settlement) / 1000  # 轉換為秒
                                 
-                                # 🎯 第2層檢查：結算後1秒，有持倉就執行強制平倉
-                                if time_since_settlement >= self.force_close_after_seconds:
-                                    symbol = self.current_position['symbol']
-                                    print(f"\n[{self.format_corrected_time()}] 🚨 第2層強制平倉觸發：結算後{time_since_settlement:.3f}秒，檢查到持倉執行強制平倉")
-                                    self.log_trade_step('close', symbol, 'layer2_independent_force_close', safe_json_serialize({
-                                        'time_to_settlement': time_to_settlement,
-                                        'time_since_settlement': time_since_settlement,
-                                        'close_after_seconds': self.close_after_seconds,
-                                        'force_close_after_seconds': self.force_close_after_seconds,
-                                        'settlement_time': datetime.fromtimestamp(current_position_settlement_time / 1000).strftime('%H:%M:%S.%f'),
-                                        'reason': '第2層平倉機制：結算後1秒檢查到持倉',
-                                        'trigger_source': 'independent_position_check'
-                                    }))
-                                    
-                                    # 🔒 強制平倉前併發檢查
-                                    if self.is_api_calling:
-                                        print(f"[{self.format_corrected_time()}] 檢測到API調用進行中，但強制平倉是最優先操作，等待完成")
-                                        self.log_trade_step('close', symbol, 'force_wait_for_api_completion', {
-                                            'api_call_duration': time.time() - self.api_call_start_time
-                                        })
-                                        # 強制平倉是最緊急操作，短暫等待後繼續
-                                        time.sleep(0.1)
-                                    
+                                # 結算後一分鐘內，每秒檢查一次
+                                if time_since_settlement <= 60:  # 60秒 = 1分鐘
+                                    print(f"\n[{self.format_corrected_time()}] 🔄 後備平倉檢查：發現持倉，執行平倉（結算後{time_since_settlement:.0f}秒）")
                                     self.is_closing = True
-                                    self.force_close_position()
-                                    time.sleep(self.check_interval)
+                                    success = self.close_position()
+                                    
+                                    if not success:
+                                        print(f"[{self.format_corrected_time()}] ⚠️ 平倉失敗，將在下次檢查時重試")
+                                        self.is_closing = False
+                                    
+                                    time.sleep(1)  # 每秒檢查一次
                                     continue
                     
                     # 獲取校正後的時間
@@ -2951,39 +2170,7 @@ class FundingRateTrader:
                                     print(status_line)
                                     self._last_display_sec = entry_secs
                             
-                            # 檢查是否到達平倉時間（結算後立即平倉）
-                            if time_to_close <= 0:  # 結算後立即平倉（獲得資金費後）
-                                if self.current_position and not self.is_closing:
-                                    print(f"\n[{self.format_corrected_time()}] 平倉時間到（結算後{self.close_after_seconds}秒），開始平倉 - 使用: {self._close_method_display}")
-                                    self.log_trade_step('close', best_opportunity['symbol'], 'time_triggered', safe_json_serialize({
-                                        'time_to_close': time_to_close,
-                                        'close_after_seconds': self.close_after_seconds,
-                                        'settlement_time': datetime.fromtimestamp(real_settlement_time / 1000).strftime('%H:%M:%S.%f')
-                                    }))
-                                    self.is_closing = True
-                                    self.close_position()
-                                    time.sleep(self.check_interval)
-                                    continue
-                            
-                            # 檢查是否需要備用強制平倉（第2層：結算後1秒檢查）
-                            if time_to_settlement <= 0 and self.current_position and not self.is_closing:
-                                # 計算結算後經過的時間
-                                time_since_settlement = abs(time_to_settlement) / 1000  # 轉換為秒
-                                
-                                # 🎯 第2層檢查：結算後1秒，有持倉就執行強制平倉
-                                if time_since_settlement >= self.force_close_after_seconds:
-                                    print(f"\n[{self.format_corrected_time()}] 🚨 第2層強制平倉觸發：結算後{time_since_settlement:.3f}秒，檢查到持倉執行強制平倉")
-                                    self.log_trade_step('close', best_opportunity['symbol'], 'layer2_force_close_triggered', safe_json_serialize({
-                                            'time_to_settlement': time_to_settlement,
-                                            'time_since_settlement': time_since_settlement,
-                                            'force_close_after_seconds': self.force_close_after_seconds,
-                                        'settlement_time': datetime.fromtimestamp(real_settlement_time / 1000).strftime('%H:%M:%S.%f'),
-                                        'reason': '第2層平倉機制：結算後1秒檢查到持倉'
-                                }))
-                                self.is_closing = True
-                                self.force_close_position()
-                                time.sleep(self.check_interval)
-                                continue
+
                             
                             # 檢查是否接近進場時間
                             if time_to_entry <= self.entry_time_tolerance:  # 使用配置的進場時間容差
@@ -3456,6 +2643,12 @@ class FundingRateTrader:
                 'ultra_fast_close_success', 'ultra_fast_close_failed',
                 'force_close_success', 'force_close_failed',
                 'minimal_close_complete', 'minimal_close_failed',
+                # 新增超高速平倉步驟
+                'ultra_speed_close_start', 'ultra_speed_close_success', 
+                'ultra_speed_close_failed', 'ultra_speed_close_error',
+                'ultra_speed_close_complete',
+                # 即時平倉步驟
+                'instant_close_success', 'instant_close_failed',
                 # 新增的詳細記錄步驟
                 'close_with_full_context', 'close_market_analysis',
                 'close_network_analysis', 'close_balance_analysis'
@@ -3574,6 +2767,73 @@ class FundingRateTrader:
                 content = f"[{display_time}] ❌ 超級極速平倉失敗: {kwargs.get('error', 'N/A')}\n"
                 content += f"[{display_time}] 🔄 回退方案: {kwargs.get('fallback', 'N/A')}\n"
                 content += f"{'='*60}\n\n"
+                
+            # 即時平倉相關步驟  
+            elif step == 'instant_close_success':
+                content = f"[{display_time}] ⚡ 即時平倉成功: {symbol} | {kwargs.get('execution_time_ms', 'N/A')}ms | ID:{kwargs.get('order_id', 'N/A')}\n"
+                content += f"[{display_time}] 🚀 方法: {kwargs.get('method', '即時平倉')}\n"
+                content += f"{'='*60}\n\n"
+                
+            elif step == 'instant_close_failed':
+                content = f"[{display_time}] ❌ 即時平倉失敗: {kwargs.get('error', 'N/A')}\n"
+                content += f"[{display_time}] 🔄 回退方案: 強制平倉\n"
+                content += f"{'='*60}\n\n"
+
+            # 超高速平倉相關步驟
+            elif step == 'ultra_speed_close_start':
+                content = f"\n{'='*70}\n"
+                content += f"⚡ 超高速平倉啟動: {symbol}\n"
+                content += f"時間: {timestamp}\n"
+                content += f"優化等級: {kwargs.get('optimization_level', 'N/A')}\n"
+                content += f"方向: {kwargs.get('direction', 'N/A')}\n"
+                content += f"數量: {kwargs.get('quantity', 'N/A')}\n"
+                content += f"進場價: {kwargs.get('entry_price', 'N/A')}\n"
+                content += f"資金費率: {kwargs.get('funding_rate', 'N/A')}%\n"
+                content += f"{'='*70}\n"
+                
+            elif step == 'ultra_speed_order_prepare':
+                content = f"[{display_time}] 📤 訂單準備: {kwargs.get('side', 'N/A')} {kwargs.get('quantity', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 類型: {kwargs.get('order_type', 'N/A')}\n"
+                content += f"[{display_time}]    └─ 僅減倉: {kwargs.get('reduce_only', 'N/A')}\n"
+                
+            elif step == 'ultra_speed_order_executed':
+                content = f"[{display_time}] ⚡ 訂單執行: ID:{kwargs.get('order_id', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 狀態: {kwargs.get('status', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 成交量: {kwargs.get('executed_qty', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 成交價: {kwargs.get('avg_price', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 訂單耗時: {kwargs.get('order_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}]    └─ 總耗時: {kwargs.get('total_time_ms', 'N/A')}ms\n"
+                
+            elif step == 'ultra_speed_close_success':
+                content = f"[{display_time}] ✅ 超高速平倉成功: 耗時:{kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}] 📊 交易結果:\n"
+                content += f"[{display_time}]    ├─ 進場價: {kwargs.get('entry_price', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 平倉價: {kwargs.get('exit_price', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 盈虧: {kwargs.get('pnl', 'N/A')} USDT\n"
+                content += f"[{display_time}]    ├─ 盈虧%: {kwargs.get('pnl_percentage', 'N/A')}%\n"
+                content += f"[{display_time}]    └─ 效率: {kwargs.get('close_efficiency', 'N/A')}\n"
+                
+            elif step == 'ultra_speed_close_failed':
+                content = f"[{display_time}] ⚠️ 超高速平倉失敗: {kwargs.get('error_reason', 'N/A')}\n"
+                content += f"[{display_time}] 📊 失敗詳情:\n"
+                content += f"[{display_time}]    ├─ 訂單狀態: {kwargs.get('order_status', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 成交量: {kwargs.get('executed_qty', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 執行時間: {kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}]    └─ 可能原因: {kwargs.get('possible_causes', 'N/A')}\n"
+                
+            elif step == 'ultra_speed_close_error':
+                content = f"[{display_time}] ❌ 超高速平倉異常: {kwargs.get('error', 'N/A')}\n"
+                content += f"[{display_time}] 🔧 錯誤詳情:\n"
+                content += f"[{display_time}]    ├─ 錯誤類型: {kwargs.get('error_type', 'N/A')}\n"
+                content += f"[{display_time}]    ├─ 執行時間: {kwargs.get('execution_time_ms', 'N/A')}ms\n"
+                content += f"[{display_time}]    └─ 恢復動作: {kwargs.get('recovery_action', 'N/A')}\n"
+                
+            elif step == 'ultra_speed_close_complete':
+                content = f"[{display_time}] 🏁 超高速平倉完成: 成功:{kwargs.get('success', 'N/A')}\n"
+                content += f"[{display_time}] 📊 最終狀態:\n"
+                content += f"[{display_time}]    ├─ 清理完成: {kwargs.get('cleanup_completed', 'N/A')}\n"
+                content += f"[{display_time}]    └─ 總執行時間: {kwargs.get('total_execution_time_ms', 'N/A')}ms\n"
+                content += f"{'='*70}\n\n"
                 
             # 平倉完成詳細記錄（延後處理）
             elif step == 'close_position_detail':
@@ -4389,7 +3649,7 @@ class FundingRateTrader:
             return system_info
         except Exception as e:
             print(f"[{self.format_corrected_time()}] 獲取網絡質量信息失敗: {e}")
-                        return {}
+            return {}
     
     def execute_api_call_with_timeout(self, api_func, *args, max_retries=3, timeout=10, **kwargs):
         """執行API調用，包含超時處理和重試機制（併發保護版）"""
@@ -4580,29 +3840,8 @@ if __name__ == "__main__":
         
         print("=== 資金費率套利機器人啟動 ===")
         print(f"啟動時間: {trader.format_corrected_time('%Y-%m-%d %H:%M:%S')}")
-        print(f"最大保證金: {MAX_POSITION_SIZE} USDT")
-        print(f"槓桿倍數: {LEVERAGE}")
-        print(f"目標倉位大小: {MAX_POSITION_SIZE * LEVERAGE} USDT")
-        print(f"最小資金費率: {MIN_FUNDING_RATE}%")
-        print(f"進場提前時間: {ENTRY_BEFORE_SECONDS} 秒")
-        print(f"平倉提前時間: {CLOSE_BEFORE_SECONDS} 秒")
-        print(f"主循環檢查間隔: {CHECK_INTERVAL} 秒")
-        print(f"持倉檢查間隔: {POSITION_CHECK_INTERVAL} 秒")
-        print(f"交易時間: {TRADING_HOURS}")
-        print(f"交易幣種: {TRADING_SYMBOLS if TRADING_SYMBOLS else '全部'}")
-        print(f"排除幣種: {EXCLUDED_SYMBOLS}")
-        print("--- 重試機制配置 ---")
-        print(f"進場重試次數: {MAX_ENTRY_RETRY}")
-        print(f"進場重試間隔: {ENTRY_RETRY_INTERVAL} 秒")
-        print(f"結算前持續重試進場: {ENTRY_RETRY_UNTIL_SETTLEMENT}")
-        print(f"平倉重試次數: {MAX_CLOSE_RETRY}")
-        print(f"平倉重試間隔: {CLOSE_RETRY_INTERVAL} 秒")
-        print(f"結算時強制平倉: {FORCE_CLOSE_AT_SETTLEMENT}")
-        print(f"強制平倉時間: 結算後 {FORCE_CLOSE_AFTER_SECONDS} 秒")
-        print("--- 定期檢查配置 ---")
-        print(f"帳戶檢查間隔: {ACCOUNT_CHECK_INTERVAL} 秒")
-        print(f"倉位超時時間: {POSITION_TIMEOUT_SECONDS} 秒")
-        print(f"啟用倉位清理: {ENABLE_POSITION_CLEANUP}")
+        print(f"機器人版本: 簡化平倉機制 v2.0 🚀")
+        print("詳細配置將在啟動後顯示...")
         print("=" * 50)
         
         # 使用 start() 方法，這樣會執行啟動通知

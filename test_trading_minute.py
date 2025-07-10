@@ -183,6 +183,12 @@ class FundingRateTrader:
         self.ws = None
         self.ws_thread = None
         self.running = False
+        
+        # 🚀 新增：槓桿緩存機制（進場速度優化）
+        self.leverage_cache = {}  # 記錄每個交易對的當前槓桿
+        self.leverage_cache_time = {}  # 記錄槓桿設置時間
+        self.leverage_cache_valid_seconds = 300  # 槓桿緩存有效期（5分鐘）
+        
         # 配置CCXT交易所實例也添加超時設置
         self.exchange = ccxt.binance({
             'apiKey': API_KEY,
@@ -204,7 +210,7 @@ class FundingRateTrader:
         self.position_check_delay_until = 0  # 倉位檢查延遲到哪個時間點
         # 新增：訂單狀態追蹤
         self.pending_order = None    # 待確認的訂單
-        self.order_status = None     # 訂單狀態
+        self.order_status = None
         # 新增：平倉狀態追蹤
         self.is_closing = False      # 是否正在平倉
         # 新增：時間同步相關
@@ -243,6 +249,9 @@ class FundingRateTrader:
         except Exception as e:
             print(f"[{self.format_corrected_time()}] Excel導出設置失敗: {e}")
         
+        # 🚀 進場速度優化：啟動時預設槓桿
+        self.preload_leverage_cache()
+        
         # 初始化點差緩存 - 按需精準更新策略
         self._spread_cache = {}                    # 存儲每個交易對的點差
         self._spread_cache_time = {}               # 存儲每個交易對的更新時間
@@ -269,6 +278,87 @@ class FundingRateTrader:
         """確定平倉模式的顯示文字 - 簡化版"""
         # 現在所有平倉都使用統一的簡化方法
         return f"⚡簡化平倉(+{self.close_after_seconds}s)"
+    
+    def should_set_leverage(self, symbol: str) -> bool:
+        """🚀 智能槓桿檢查 - 只在必要時設置槓桿，大幅提升進場速度"""
+        try:
+            current_time = time.time()
+            
+            # 檢查是否有緩存記錄
+            if symbol in self.leverage_cache and symbol in self.leverage_cache_time:
+                cache_age = current_time - self.leverage_cache_time[symbol]
+                cached_leverage = self.leverage_cache[symbol]
+                
+                # 如果緩存有效且槓桿相同，跳過設置
+                if cache_age < self.leverage_cache_valid_seconds and cached_leverage == self.leverage:
+                    return False
+            
+            # 查詢當前槓桿（快速檢查）
+            try:
+                positions = self.client.futures_position_information(symbol=symbol)
+                if positions:
+                    current_leverage = int(positions[0].get('leverage', 0))
+                    
+                    # 更新緩存
+                    self.leverage_cache[symbol] = current_leverage
+                    self.leverage_cache_time[symbol] = current_time
+                    
+                    # 如果槓桿已經正確，跳過設置
+                    if current_leverage == self.leverage:
+                        return False
+            except Exception as e:
+                print(f"[{self.format_corrected_time()}] 檢查槓桿失敗: {symbol} - {e}")
+                # 如果檢查失敗，為安全起見還是設置槓桿
+                
+            return True
+            
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 槓桿檢查異常: {symbol} - {e}")
+            return True  # 異常時為安全起見設置槓桿
+    
+    def preload_leverage_cache(self):
+        """🚀 預載槓桿緩存 - 啟動時批量設置常用交易對槓桿，極大提升進場速度"""
+        try:
+            print(f"[{self.format_corrected_time()}] 🚀 開始預載槓桿緩存...")
+            
+            # 獲取所有期貨交易對
+            exchange_info = self.client.futures_exchange_info()
+            active_symbols = [s['symbol'] for s in exchange_info['symbols'] 
+                            if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')]
+            
+            # 限制預載數量（避免過多API調用）
+            max_preload = 50  # 預載前50個活躍交易對
+            symbols_to_preload = active_symbols[:max_preload]
+            
+            print(f"[{self.format_corrected_time()}] 預載 {len(symbols_to_preload)} 個交易對的槓桿...")
+            
+            success_count = 0
+            for symbol in symbols_to_preload:
+                try:
+                    # 設置槓桿
+                    self.client.futures_change_leverage(symbol=symbol, leverage=self.leverage)
+                    
+                    # 更新緩存
+                    self.leverage_cache[symbol] = self.leverage
+                    self.leverage_cache_time[symbol] = time.time()
+                    
+                    success_count += 1
+                    
+                    # 避免觸發限流
+                    if success_count % 10 == 0:
+                        print(f"[{self.format_corrected_time()}] 已預載 {success_count} 個交易對...")
+                        time.sleep(0.1)  # 小幅延遲避免限流
+                        
+                except Exception as e:
+                    # 單個交易對失敗不影響其他交易對
+                    continue
+            
+            print(f"[{self.format_corrected_time()}] ✅ 槓桿預載完成: 成功 {success_count}/{len(symbols_to_preload)} 個交易對")
+            print(f"[{self.format_corrected_time()}] 🚀 進場速度優化：槓桿設置耗時預計從 ~750ms 降至 ~0ms")
+            
+        except Exception as e:
+            print(f"[{self.format_corrected_time()}] 預載槓桿緩存失敗: {e}")
+            print(f"[{self.format_corrected_time()}] 將使用智能槓桿檢查作為備用方案")
 
     def _setup_logger(self):
         """設置日誌 - 使用全域日誌器，避免重複"""
@@ -813,12 +903,33 @@ class FundingRateTrader:
                 'next_funding_time': next_funding_time
             }))
             
-            # 設置槓桿
-            print(f"[{self.format_corrected_time()}] 設置槓桿: {symbol} {self.leverage}倍")
-            self.log_trade_step('entry', symbol, 'set_leverage', {'leverage': self.leverage})
-            self.client.futures_change_leverage(symbol=symbol, leverage=self.leverage)
-            self.log_trade_step('entry', symbol, 'leverage_set', {'leverage': self.leverage})
-            # 記錄槓桿設置完成（已在上面log_trade_step記錄，避免重複）
+            # 🚀 智能槓桿設置 - 只在必要時設置，大幅提升進場速度
+            leverage_set_time = 0
+            leverage_start_time = time.time()
+            
+            if self.should_set_leverage(symbol):
+                print(f"[{self.format_corrected_time()}] 設置槓桿: {symbol} {self.leverage}倍")
+                self.log_trade_step('entry', symbol, 'set_leverage', {'leverage': self.leverage})
+                self.client.futures_change_leverage(symbol=symbol, leverage=self.leverage)
+                leverage_set_time = int((time.time() - leverage_start_time) * 1000)
+                
+                # 更新槓桿緩存
+                self.leverage_cache[symbol] = self.leverage
+                self.leverage_cache_time[symbol] = time.time()
+                
+                self.log_trade_step('entry', symbol, 'leverage_set', {
+                    'leverage': self.leverage,
+                    'execution_time_ms': leverage_set_time
+                })
+                print(f"[{self.format_corrected_time()}] 槓桿設置完成: {symbol} {self.leverage}倍 ({leverage_set_time}ms)")
+            else:
+                leverage_set_time = 0
+                print(f"[{self.format_corrected_time()}] 跳過槓桿設置: {symbol} (已緩存)")
+                self.log_trade_step('entry', symbol, 'leverage_skipped', {
+                    'leverage': self.leverage,
+                    'reason': 'cached',
+                    'execution_time_ms': 0
+                })
             
             # 獲取當前價格 - 使用快速方法
             print(f"[{self.format_corrected_time()}] 獲取當前價格: {symbol}")
@@ -889,7 +1000,7 @@ class FundingRateTrader:
                 'type': 'MARKET'
             })
             
-            # 發送訂單
+            # 🚀 優化訂單發送 - 進場時使用極速模式
             print(f"[{self.format_corrected_time()}] 發送開倉訂單: {symbol} {side} {quantity}")
             self.log_trade_step('entry', symbol, 'send_order_start', {
                 'side': side, 
@@ -897,18 +1008,40 @@ class FundingRateTrader:
                 'type': 'MARKET'
             })
             order_start_time = time.time()
-            # 使用超時處理的API調用
-            order = self.execute_api_call_with_timeout(
-                self.client.futures_create_order,
-                symbol=symbol,
-                side=side,
-                type='MARKET',
-                quantity=quantity,
-                timeout=10,  # 10秒超時
-                max_retries=2  # 最多重試2次
-            )
-            order_end_time = time.time()
-            execution_time_ms = int((order_end_time - order_start_time) * 1000)
+            
+            # 進場時使用極速模式：直接發送，不重試，超時時間縮短
+            try:
+                order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=quantity
+                )
+                order_end_time = time.time()
+                execution_time_ms = int((order_end_time - order_start_time) * 1000)
+                
+                print(f"[{self.format_corrected_time()}] ⚡ 極速進場成功: {execution_time_ms}ms")
+                
+            except Exception as e:
+                order_end_time = time.time()
+                execution_time_ms = int((order_end_time - order_start_time) * 1000)
+                print(f"[{self.format_corrected_time()}] ❌ 極速進場失敗: {execution_time_ms}ms - {e}")
+                
+                # 如果極速模式失敗，使用備用方案
+                print(f"[{self.format_corrected_time()}] 使用備用方案重新發送...")
+                order_start_time = time.time()
+                order = self.execute_api_call_with_timeout(
+                    self.client.futures_create_order,
+                    symbol=symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=quantity,
+                    timeout=5,  # 縮短超時時間
+                    max_retries=1  # 減少重試次數
+                )
+                order_end_time = time.time()
+                execution_time_ms = int((order_end_time - order_start_time) * 1000)
+                print(f"[{self.format_corrected_time()}] 備用方案完成: {execution_time_ms}ms")
             print(f"[{self.format_corrected_time()}] 訂單發送完成: {symbol} 訂單ID:{order['orderId']} 執行時間:{execution_time_ms}ms")
             self.log_trade_step('entry', symbol, 'send_order_success', {
                 'order_id': order['orderId'],
@@ -2506,6 +2639,15 @@ class FundingRateTrader:
             
             # 設置槓桿
             print(f"[{self.format_corrected_time()}] 設置槓桿倍數: {self.leverage}")
+            
+            # 🚀 進場速度優化：初始化時再次檢查槓桿預載
+            print(f"[{self.format_corrected_time()}] 🚀 檢查槓桿預載狀態...")
+            cached_count = len(self.leverage_cache)
+            if cached_count > 0:
+                print(f"[{self.format_corrected_time()}] ✅ 槓桿預載已完成: {cached_count} 個交易對")
+                print(f"[{self.format_corrected_time()}] 🚀 進場速度優化啟用：槓桿設置耗時 ~750ms → ~0ms")
+            else:
+                print(f"[{self.format_corrected_time()}] ⚠️ 槓桿預載失敗，將使用智能槓桿檢查")
             
             # 啟動首次點差緩存更新
             print(f"[{self.format_corrected_time()}] 啟動首次點差緩存更新...")

@@ -439,22 +439,33 @@ class FundingRateTrader:
             print(f"原始數據前100字元: {str(message)[:100]}...")
 
     def on_error(self, ws, error):
-        """處理 WebSocket 錯誤 - 智能重連"""
+        """處理 WebSocket 錯誤 - 超智能重連"""
         self.ws_reconnect_count += 1
         error_str = str(error)
         
         print(f"[{self.format_corrected_time()}] WebSocket 錯誤 (第{self.ws_reconnect_count}次): {error}")
         
+        # 重置訂閱狀態
+        self.subscription_sent = False
+        
         # 分析錯誤類型
         if "ping/pong timed out" in error_str:
-            print(f"[{self.format_corrected_time()}] 🔄 檢測到 ping/pong 超時，這是常見的網路問題")
-            reconnect_delay = min(5 + self.ws_reconnect_count, 30)  # 漸進式延遲，最多30秒
+            print(f"[{self.format_corrected_time()}] 🔄 檢測到 ping/pong 超時，網路波動引起")
+            
+            # ping/pong 超時不立即重連，先等待網路穩定
+            if self.ws_reconnect_count <= 5:
+                reconnect_delay = 10  # 前5次等待10秒
+            elif self.ws_reconnect_count <= 10:
+                reconnect_delay = 20  # 中期等待20秒
+            else:
+                reconnect_delay = 30  # 長期等待30秒
+                
         elif "Connection" in error_str or "Network" in error_str:
-            print(f"[{self.format_corrected_time()}] 🔄 檢測到連接問題，可能是網路不穩定")
-            reconnect_delay = min(3 + self.ws_reconnect_count, 20)  # 漸進式延遲，最多20秒
+            print(f"[{self.format_corrected_time()}] 🔄 檢測到連接問題，網路不穩定")
+            reconnect_delay = min(8 + self.ws_reconnect_count * 2, 25)  # 漸進式延遲，最多25秒
         else:
             print(f"錯誤詳情: {traceback.format_exc()}")
-            reconnect_delay = min(10 + self.ws_reconnect_count, 60)  # 未知錯誤，更長延遲
+            reconnect_delay = min(12 + self.ws_reconnect_count * 3, 45)  # 未知錯誤，更長延遲
         
         self.ws = None
         print(f"[{self.format_corrected_time()}] 等待 {reconnect_delay} 秒後重新連接...")
@@ -462,21 +473,24 @@ class FundingRateTrader:
         self.reconnect()
 
     def on_close(self, ws, close_status_code, close_msg):
-        """處理 WebSocket 關閉 - 智能重連"""
+        """處理 WebSocket 關閉 - 超智能重連"""
         self.ws_reconnect_count += 1
         
         print(f"[{self.format_corrected_time()}] WebSocket 連接已關閉 (第{self.ws_reconnect_count}次)")
         print(f"狀態碼: {close_status_code}, 訊息: {close_msg}")
         
+        # 重置訂閱狀態
+        self.subscription_sent = False
+        
         # 根據關閉狀態決定重連策略
         if close_status_code == 1006:  # 異常斷開
-            reconnect_delay = min(2 + self.ws_reconnect_count, 15)
+            reconnect_delay = min(8 + self.ws_reconnect_count * 2, 20)
             print(f"[{self.format_corrected_time()}] 🔄 連接異常斷開，等待 {reconnect_delay} 秒後重連")
         elif close_status_code == 1000:  # 正常關閉
-            reconnect_delay = 1
-            print(f"[{self.format_corrected_time()}] 🔄 連接正常關閉，快速重連")
+            reconnect_delay = 3
+            print(f"[{self.format_corrected_time()}] 🔄 連接正常關閉，等待 {reconnect_delay} 秒後重連")
         else:
-            reconnect_delay = min(5 + self.ws_reconnect_count, 30)
+            reconnect_delay = min(10 + self.ws_reconnect_count * 2, 35)
             print(f"[{self.format_corrected_time()}] 🔄 未知關閉原因，等待 {reconnect_delay} 秒後重連")
         
         self.ws = None
@@ -487,20 +501,44 @@ class FundingRateTrader:
         """WebSocket 連接開啟時的回調"""
         print(f"[{self.format_corrected_time()}] ✅ WebSocket 連接已開啟")
         
-        # 重置重連計數器
+        # 重置重連計數器和狀態
         self.ws_reconnect_count = 0
         
-        # 等待連接完全建立
-        time.sleep(1)
+        # 防止重複訂閱
+        if not hasattr(self, 'subscription_sent'):
+            self.subscription_sent = False
         
-        # 訂閱所有交易對的資金費率
-        self.subscribe()
-        print(f"[{self.format_corrected_time()}] 📡 已發送訂閱請求，等待資金費率數據...")
+        if not self.subscription_sent:
+            # 等待連接完全建立
+            time.sleep(1)
+            
+            # 訂閱所有交易對的資金費率
+            self.subscribe()
+            print(f"[{self.format_corrected_time()}] 📡 已發送訂閱請求，等待資金費率數據...")
+            self.subscription_sent = True
+        else:
+            print(f"[{self.format_corrected_time()}] 📡 訂閱已存在，跳過重複訂閱")
 
     def start_websocket(self):
-        """啟動 WebSocket 連接 - 增強版重連機制"""
+        """啟動 WebSocket 連接 - 超穩定版重連機制"""
         try:
+            # 防止重複連接
+            if hasattr(self, 'is_websocket_starting') and self.is_websocket_starting:
+                print(f"[{self.format_corrected_time()}] 🔄 WebSocket 正在啟動中，忽略重複請求")
+                return
+            
+            self.is_websocket_starting = True
+            
             print(f"[{self.format_corrected_time()}] 啟動 WebSocket 連接...")
+            
+            # 清理舊連接
+            if self.ws:
+                try:
+                    self.ws.close()
+                    print(f"[{self.format_corrected_time()}] 已清理舊連接")
+                except:
+                    pass
+            
             # 幣安期貨暫時只支援標記價格的集合流，bookTicker需要單獨連接
             # 先使用標記價格流，bookTicker功能後續添加
             stream_url = "wss://fstream.binance.com/ws/!markPrice@arr"
@@ -518,24 +556,26 @@ class FundingRateTrader:
                 on_open=self.on_open
             )
             
-            # 在新線程中啟動 WebSocket - 增強設定
+            # 在新線程中啟動 WebSocket - 超穩定設定
             self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(
-                ping_interval=20,      # 縮短到20秒 (更頻繁心跳)
-                ping_timeout=15,       # 增加到15秒 (更長超時)
-                reconnect=3            # 自動重連間隔3秒
+                ping_interval=30,      # 增加到30秒 (減少心跳頻率)
+                ping_timeout=20,       # 增加到20秒 (更長超時容忍)
+                reconnect=5            # 自動重連間隔5秒
             ))
             self.ws_thread.daemon = True
             self.ws_thread.start()
             
-            print(f"[{self.format_corrected_time()}] WebSocket 線程已啟動 (資金費率) - 心跳20秒/超時15秒")
+            print(f"[{self.format_corrected_time()}] WebSocket 線程已啟動 (資金費率) - 心跳30秒/超時20秒")
             
             # 等待 WebSocket 連接建立
-            time.sleep(2)
+            time.sleep(3)
             
         except Exception as e:
             print(f"[{self.format_corrected_time()}] 啟動 WebSocket 失敗: {e}")
-            time.sleep(5)
+            time.sleep(10)
             self.start_websocket()
+        finally:
+            self.is_websocket_starting = False
 
     def get_spread(self, symbol: str) -> float:
         """獲取交易對的點差 (買賣價差百分比) - 按需精準緩存策略"""
@@ -2483,12 +2523,19 @@ class FundingRateTrader:
             print(f"[{self.format_corrected_time()}] 關閉WebSocket失敗: {e}")
 
     def reconnect(self):
-        """重新連接 WebSocket - 增強版"""
+        """重新連接 WebSocket - 超穩定版"""
         try:
-            # 重連次數限制
-            if self.ws_reconnect_count > 20:
-                print(f"[{self.format_corrected_time()}] ⚠️ WebSocket 重連次數過多 ({self.ws_reconnect_count}次)，暫停60秒")
-                time.sleep(60)
+            # 防止並行重連
+            if hasattr(self, 'is_reconnecting') and self.is_reconnecting:
+                print(f"[{self.format_corrected_time()}] 🔄 WebSocket 重連進行中，忽略重複請求")
+                return
+            
+            self.is_reconnecting = True
+            
+            # 重連次數限制和冷卻
+            if self.ws_reconnect_count > 15:
+                print(f"[{self.format_corrected_time()}] ⚠️ WebSocket 重連次數過多 ({self.ws_reconnect_count}次)，暫停90秒")
+                time.sleep(90)
                 self.ws_reconnect_count = 0  # 重置計數器
             
             print(f"[{self.format_corrected_time()}] 🔄 開始重新連接 WebSocket (第{self.ws_reconnect_count}次)...")
@@ -2497,12 +2544,21 @@ class FundingRateTrader:
             if self.ws:
                 try:
                     self.ws.close()
+                    print(f"[{self.format_corrected_time()}] 已清理舊連接")
                 except Exception as e:
                     print(f"[{self.format_corrected_time()}] 關閉舊連接: {e}")
             self.ws = None
             
-            # 等待一段時間再重連
-            time.sleep(min(3 + self.ws_reconnect_count * 0.5, 10))
+            # 漸進式退避等待 - 根據重連次數調整
+            if self.ws_reconnect_count <= 3:
+                backoff_time = 5  # 前3次快速重連
+            elif self.ws_reconnect_count <= 8:
+                backoff_time = 10  # 中期重連
+            else:
+                backoff_time = 20  # 長期重連
+            
+            print(f"[{self.format_corrected_time()}] 等待 {backoff_time} 秒後重連...")
+            time.sleep(backoff_time)
             
             # 重新啟動 WebSocket
             self.start_websocket()
@@ -2513,10 +2569,12 @@ class FundingRateTrader:
             print(f"錯誤詳情: {traceback.format_exc()}")
             
             # 如果重連失敗，增加等待時間
-            backoff_time = min(10 + self.ws_reconnect_count * 2, 60)
+            backoff_time = min(15 + self.ws_reconnect_count * 3, 120)
             print(f"[{self.format_corrected_time()}] 等待 {backoff_time} 秒後重新嘗試...")
             time.sleep(backoff_time)
             self.reconnect()
+        finally:
+            self.is_reconnecting = False
 
     def start(self):
         """啟動交易機器人"""

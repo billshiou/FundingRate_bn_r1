@@ -1,6 +1,8 @@
-# ⚡ 快速啟動指南
+# ⚡ 快速啟動指南 (v2.1)
 
 > 5分鐘內完成機器人配置和啟動
+> 
+> **v2.1 新功能**: API 速度優化，3-10倍性能提升
 
 ## 🚀 超快速開始（3步驟）
 
@@ -65,7 +67,7 @@ LEVERAGE = 1
 MIN_FUNDING_RATE = 0.3
 MAX_SPREAD = 2.0
 ENTRY_BEFORE_SECONDS = 1.0
-CLOSE_AFTER_SECONDS = 1.0
+CLOSE_AFTER_SECONDS = 1.0     # 平倉延遲
 ```
 
 ### ⚡ 進階快速
@@ -75,18 +77,32 @@ LEVERAGE = 2
 MIN_FUNDING_RATE = 0.15
 MAX_SPREAD = 3.0
 ENTRY_BEFORE_SECONDS = 0.5
-CLOSE_AFTER_SECONDS = 0.5
+CLOSE_AFTER_SECONDS = 0.5     # 平倉延遲
 ```
 
-### 🏎️ 專業極速
+### 🏎️ 專業極速 (v2.1 優化)
 ```python
 MAX_POSITION_SIZE = 100
 LEVERAGE = 3
 MIN_FUNDING_RATE = 0.1
 MAX_SPREAD = 5.0
 ENTRY_BEFORE_SECONDS = 0.25
-CLOSE_AFTER_SECONDS = 0.1
+CLOSE_AFTER_SECONDS = 0.1     # 平倉延遲
 ```
+
+## 🚀 v2.1 性能優化
+
+### ⚡ API 速度提升
+- **進場訂單**: 3-10倍速度提升
+- **槓桿檢查**: 1-4倍速度提升  
+- **倉位檢查**: 1-5倍速度提升
+- **平倉訂單**: 保持極速執行
+
+### 🛡️ 智能保護
+- **超時控制**: 所有API調用1秒超時
+- **自動重試**: 最多2次重試，指數退避
+- **併發保護**: 防止API調用衝突
+- **狀態重置**: 15秒內卡住的調用自動重置
 
 ## 🔍 快速測試
 

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-資金費率套利機器人 - 快速啟動腳本
+資金費率套利機器人 - 快速啟動腳本 (v2.1)
 提供簡單的啟動界面和配置檢查
+
+v2.1 更新:
+- API 速度優化 (3-10倍提升)
+- 智能重試機制
+- 併發保護和狀態重置
 """
 
 import os
@@ -92,7 +97,7 @@ def show_config_summary():
         print(f"   槓桿倍數: {getattr(config, 'LEVERAGE', 'N/A')}x")
         print(f"   最小資金費率: {getattr(config, 'MIN_FUNDING_RATE', 'N/A')}%")
         print(f"   進場提前時間: {getattr(config, 'ENTRY_BEFORE_SECONDS', 'N/A')}秒")
-        print(f"   平倉提前時間: {getattr(config, 'CLOSE_BEFORE_SECONDS', 'N/A')}秒")
+        print(f"   平倉延遲時間: {getattr(config, 'CLOSE_AFTER_SECONDS', 'N/A')}秒")
         print(f"   最大進場重試: {getattr(config, 'MAX_ENTRY_RETRY', 'N/A')}次")
         print(f"   最大平倉重試: {getattr(config, 'MAX_CLOSE_RETRY', 'N/A')}次")
     except ImportError:

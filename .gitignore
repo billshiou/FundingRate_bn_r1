@@ -16,6 +16,8 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -122,12 +124,14 @@ config_local.py
 config_production.py
 
 # 日誌文件
+logs/
+*.log
 logs/*.log
 logs/*.txt
-*.log
 
 # 交易數據
 *.csv
+*.xlsx
 trade_history.json
 trade_*.json
 data/
@@ -148,6 +152,7 @@ backup/
 *.pem
 *.key
 *.crt
+*.p12
 
 # 數據庫文件
 *.db
@@ -159,91 +164,9 @@ backup/
 *.tar.gz
 *.rar
 
-# 其他
+# 其他敏感文件
 .env.local
 .env.production
 secrets.json
 credentials.json
-
-# 配置文件 - 包含敏感信息，不要上傳
-config.py
-config_local.py
-config_production.py
-
-# 交易數據和歷史記錄
-trade_history.json
-trade_*.json
-*.csv
-*.xlsx
-
-# 日誌文件
-logs/
-*.log
-
-# Python 相關
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# 虛擬環境
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE 相關
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# 系統文件
-.DS_Store
-Thumbs.db
-
-# 臨時文件
-*.tmp
-*.temp
-*.bak
-
-# 數據庫文件
-*.db
-*.sqlite3
-
-# 測試覆蓋率
-.coverage
-.pytest_cache/
-htmlcov/
-
-# 其他敏感文件
-*.key
-*.pem
-*.crt
-*.p12
 secrets.txt 
